@@ -1,0 +1,39 @@
+name: Upstream baseline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-x64:
+    name: Windows x64 (MSVC build + tests, regression check)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl
+      - name: Build
+        shell: bash
+        run: cmake --build build -- -k 0 2>&1 | tee build.log; exit ${PIPESTATUS[0]}
+      - name: Surface build errors
+        if: failure()
+        shell: bash
+        run: grep -E "error|FAILED" build.log | head -40 | sed 's/^/::error::/' || true
+      - name: Test
+        shell: bash
+        run: |
+          set -o pipefail
+          failed=0
+          for exe in build/galaxy_*_tests.exe; do
+            if ! "$exe" > out.txt 2>&1; then
+              failed=1
+              echo "::error::$(basename "$exe") failed: $(tail -3 out.txt | tr '\n' ' ')"
+            fi
+          done
+          exit $failed
+
