@@ -744,6 +744,7 @@ add_executable(NebulaRuntime
     runtime/src/native_runtime.cpp
     runtime/src/native_thp_video.cpp
     runtime/src/coop_scheduler.cpp
+    runtime/src/host_fiber.cpp
     runtime/src/site_hooks.cpp
 )
 # Exported releases pass their source identity; working checkouts report Git

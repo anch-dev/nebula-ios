@@ -35,32 +35,41 @@ On a non-Windows host the top-level `CMakeLists.txt` includes
    decodes LDR/STR/LDP/STP/LDUR/pre-/post-index/register-offset, SIMD&FP
    scalar forms and LD1/ST1 lanes. Handles SVE signal frames on Linux.
 
-Tests pass on x86-64, on AArch64 under QEMU (clang and GCC), and natively in CI
-on Linux ARM64 and macOS Apple Silicon; the iOS compile job is green too:
-`host_fiber_tests`, `coop_scheduler_tests`, `flat_guest_memory_posix_tests`.
+4. **Fixed guest base removed** — runtime call sites use
+   `flat_guest_memory::guest_base()`; the fault handler's thread id comes from
+   `current_thread_id()`.
+5. **Non-graphics runtime layers** — POSIX implementations of
+   `atomic_file` (O_EXCL temp + fsync + rename), `runtime_instance` (flock),
+   `runtime_settings`/`input_bindings` (Apple: ~/Library/Application Support,
+   Linux: XDG; locale shims), `runtime_timeline` (mach_absolute_time /
+   CLOCK_MONOTONIC counter, `host_event` waits, QoS on Apple) and
+   `frame_telemetry` (no-op: the overlay IPC is Windows-only).
+   Shared vocabulary lives in `platform_compat.h` (MSVC CRT shims) and
+   `win32_portable.h` (SRWLOCK, VK_* and XINPUT_* constants: the runtime's
+   key/gamepad formats on every platform).
+
+CI (`.github/workflows/apple-port.yml`): 42 upstream + port tests pass on
+Linux ARM64 and natively on macOS Apple Silicon; the iOS build compiles; a
+Windows MSVC job builds the original runtime and runs its tests to catch
+regressions. Locally they also pass on x86-64 and AArch64 under QEMU (the
+timeline race test can time out under heavy QEMU load only).
 
 ## Next steps
 
-4. **Replace `kGuestBase` at call sites** with `flat_guest_memory::guest_base()`:
-   `native_host.cpp` (~11292), `native_runtime.cpp` (`coop_ram`, ~16261),
-   `flat_guest_read.h`. Use `current_thread_id()` instead of
-   `GetCurrentThreadId()` for `FaultAccessCallbacks::thread_id`.
-5. **Remaining Win32 in the non-graphics runtime**: `ppc_float.cpp` (SSE fast
-   path; add a scalar `#else`), `runtime_timeline.cpp` (QPC, `__cpuid`, MMCSS
-   → `mach_absolute_time`/`clock_gettime`), `atomic_file.cpp`
-   (`rename`), `runtime_instance.cpp` (named mutex → `flock`),
-   `runtime_settings.cpp`/`input_bindings.cpp` (`SRWLOCK` → `std::shared_mutex`),
-   `frame_telemetry.cpp`, `native_dsp.cpp`, then `native_runtime.cpp` and
-   `native_host.cpp` (window, audio, input glue). Fast float must call
-   `fp_enable_flush_denormals()` where Windows sets MXCSR FTZ|DAZ.
-6. **Renderer**: a Metal backend beside `renderer_d3d12.cpp` (~11k lines),
+6. **Host glue**: `native_runtime.cpp` (~33k lines) and `native_host.cpp`
+   still use Win32 for the window, audio (XAudio2), controllers (XInput/HID),
+   module loading (`LoadLibrary` of RMGE01*.dll), crash handling and
+   the idle wait (`CreateWaitableTimerExW` → `host_event`). Split each into a
+   platform-neutral core plus a Windows backend and an Apple backend
+   (AVAudioEngine/AudioUnit, GameController, `dlopen`).
+7. **Renderer**: a Metal backend beside `renderer_d3d12.cpp` (~11k lines),
    HLSL uber-shaders → MSL. GX parsing/state above it is shared.
-7. **Game module pipeline**: generated C++ → arm64 dylib(s) built on the
+8. **Game module pipeline**: generated C++ → arm64 dylib(s) built on the
    user's PC (stock clang + lld, `-target arm64-apple-ios`), injected into the
    IPA before sideloading. Needs a header set that does not depend on the iOS
    SDK; to be verified.
-8. **iOS app shell**: Xcode/CMake project, CAMetalLayer view, GameController,
-   AVAudioEngine/AudioUnit, touch controls, gyro pointer; built unsigned in CI.
+9. **iOS app shell**: Xcode/CMake project, CAMetalLayer view, touch controls,
+   gyro pointer; built unsigned in CI.
 
 ## Risks
 
