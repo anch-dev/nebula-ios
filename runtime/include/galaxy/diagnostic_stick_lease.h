@@ -11,6 +11,10 @@
 #include <optional>
 #include <string_view>
 #include <system_error>
+#if defined(__APPLE__) && defined(_LIBCPP_VERSION)
+#include <string>
+#include "galaxy/platform_compat.h"
+#endif
 
 namespace galaxy::input {
 
@@ -65,12 +69,30 @@ parse_diagnostic_stick_command(std::string_view text) noexcept {
                result.ptr == field.data() + field.size();
     };
     const auto axis = [](std::string_view field, float& value) {
+#if defined(__APPLE__) && defined(_LIBCPP_VERSION)
+        // Apple's libc++ has no floating-point from_chars on the deployment
+        // targets in use: parse in the C locale and require the same shape
+        // (decimal or exponent form, optional leading '-', whole field).
+        if (field.empty() || field.size() > 64u ||
+            !(field.front() == '-' || field.front() == '.' ||
+              (field.front() >= '0' && field.front() <= '9')) ||
+            field.find_first_of("xXpP") != std::string_view::npos) {
+            return false;
+        }
+        static const _locale_t c_locale = _create_locale(LC_NUMERIC, "C");
+        const std::string copy(field);
+        char* end = nullptr;
+        value = _strtof_l(copy.c_str(), &end, c_locale);
+        return end == copy.c_str() + copy.size() &&
+               std::isfinite(value) && value >= -1.0f && value <= 1.0f;
+#else
         const auto result = std::from_chars(
             field.data(), field.data() + field.size(), value,
             std::chars_format::general);
         return result.ec == std::errc{} &&
                result.ptr == field.data() + field.size() &&
                std::isfinite(value) && value >= -1.0f && value <= 1.0f;
+#endif
     };
     if (!decimal(fields[0], command.sequence) || command.sequence == 0u ||
         !decimal(fields[1], command.duration_ms) || command.duration_ms > 2000u ||
