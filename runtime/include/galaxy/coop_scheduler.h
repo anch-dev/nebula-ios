@@ -3,7 +3,7 @@
 // Cooperative guest scheduler (GALAXY_COOP=1): every guest OSThread runs on
 // its own host fiber of the simulation thread, and SelectThread is host code
 // that keeps the RVL SDK's run queues in guest RAM exactly as the SDK does. A
-// thread switch is one SwitchToFiber; nothing unwinds and nothing is resumed
+// thread switch is one host fiber switch (galaxy/host_fiber.h); nothing unwinds and nothing is resumed
 // through OSLoadContext. Interrupt-level work (VI, alarms, device callbacks)
 // runs as plain calls on the current fiber with the scheduler disabled, and
 // the end-of-interrupt reschedule runs once the runtime callback that
@@ -152,7 +152,7 @@ private:
         bool boot = false;
     };
 
-    static void __stdcall fiber_entry(void* parameter);
+    static void fiber_entry(void* parameter);
     void switch_to(std::uint32_t next);
     [[noreturn]] void return_to_boot() noexcept;
     ChainState& running_chain() noexcept;
@@ -172,7 +172,8 @@ private:
     // SelectThread).
     ChainState unowned_chain_{};
     std::uint32_t running_thread_ = 0u;
-    unsigned int mxcsr_ = 0u;
+    // Host FP control (MXCSR or FPCR) new fibers start from.
+    std::uint64_t fp_control_ = 0u;
     // Fibers of exited or recreated threads; deleted from another fiber.
     std::vector<void*> retired_;
     std::exception_ptr fiber_error_{};

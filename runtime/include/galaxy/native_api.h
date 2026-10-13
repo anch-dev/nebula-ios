@@ -18,6 +18,7 @@
 #include <intrin.h>
 #endif
 
+#include "galaxy/platform_compat.h"
 #include "galaxy/ppc_float.h"
 
 #if defined(_WIN32)

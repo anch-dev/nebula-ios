@@ -18,6 +18,12 @@
 
 #include <cmath>
 
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(_MSC_VER)
+#include <immintrin.h>
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
 #ifndef GALAXY_FAST_FLOAT
 #define GALAXY_FAST_FLOAT 0
 #endif
@@ -887,10 +893,23 @@ GALAXY_ALWAYS_INLINE void scalar_frsp_fast(
 // matches the exact helper.
 GALAXY_ALWAYS_INLINE std::uint64_t fctiwz_bits(std::uint64_t source) noexcept {
     const double value = as_f64(source);
+#if defined(_M_X64) || defined(__x86_64__)
     std::int32_t integer = _mm_cvttsd_si32(_mm_set_sd(value));
     if (integer == static_cast<std::int32_t>(0x80000000u) && value > 0.0) {
         integer = 0x7FFFFFFF;
     }
+#else
+    // Same results without cvttsd2si: NaN and negative overflow give INT32_MIN,
+    // positive overflow saturates to INT32_MAX, everything else truncates.
+    std::int32_t integer;
+    if (value != value || value <= -2147483649.0) {
+        integer = static_cast<std::int32_t>(0x80000000u);
+    } else if (value >= 2147483648.0) {
+        integer = 0x7FFFFFFF;
+    } else {
+        integer = static_cast<std::int32_t>(value);
+    }
+#endif
     return 0xFFF8000000000000ull | static_cast<std::uint32_t>(integer);
 }
 
@@ -1140,8 +1159,103 @@ GALAXY_ALWAYS_INLINE SinglePair ternary_single_pair(
         ternary_op_f32<Operation>(a_lanes[1], c_lanes[1], b_lanes[1]), 0.0F, 0.0F);
 #endif
 }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+// AArch64 (Apple Silicon, iOS, ARM Linux): the same lane layout on NEON.
+// Arithmetic is IEEE binary64/binary32 with the host's round-to-nearest, as on
+// SSE2. Fused forms go lane by lane through ternary_op, the exact scalar
+// definition the non-FMA x86 build uses.
+using Pair = float64x2_t;
+
+GALAXY_ALWAYS_INLINE Pair make_pair(std::uint64_t ps0, std::uint64_t ps1) noexcept {
+    return vreinterpretq_f64_u64(vcombine_u64(vcreate_u64(ps0), vcreate_u64(ps1)));
+}
+
+template <PairedLane Lane>
+GALAXY_ALWAYS_INLINE Pair select_lanes(std::uint64_t ps0, std::uint64_t ps1) noexcept {
+    if constexpr (Lane == PairedLane::Lane0) {
+        return vdupq_n_f64(as_f64(ps0));
+    } else if constexpr (Lane == PairedLane::Lane1) {
+        return vdupq_n_f64(as_f64(ps1));
+    } else {
+        return make_pair(ps0, ps1);
+    }
+}
+
+GALAXY_ALWAYS_INLINE std::uint64_t lane0_bits(Pair value) noexcept {
+    return vgetq_lane_u64(vreinterpretq_u64_f64(value), 0);
+}
+
+GALAXY_ALWAYS_INLINE std::uint64_t lane1_bits(Pair value) noexcept {
+    return vgetq_lane_u64(vreinterpretq_u64_f64(value), 1);
+}
+
+GALAXY_ALWAYS_INLINE Pair round_to_single(Pair value) noexcept {
+    return vcvt_f64_f32(vcvt_f32_f64(value));
+}
+
+GALAXY_ALWAYS_INLINE Pair round_multiplier_25(Pair value) noexcept {
+    const uint64x2_t bits = vreinterpretq_u64_f64(value);
+    return vreinterpretq_f64_u64(vandq_u64(
+        vaddq_u64(bits, vdupq_n_u64(0x0000000008000000ull)),
+        vdupq_n_u64(0xFFFFFFFFF0000000ull)));
+}
+
+template <PpcFloatBinaryOperation Operation>
+GALAXY_ALWAYS_INLINE Pair binary_pair(Pair left, Pair right) noexcept {
+    if constexpr (Operation == PpcFloatBinaryOperation::Add) {
+        return vaddq_f64(left, right);
+    } else if constexpr (Operation == PpcFloatBinaryOperation::Subtract) {
+        return vsubq_f64(left, right);
+    } else if constexpr (Operation == PpcFloatBinaryOperation::Multiply) {
+        return vmulq_f64(left, right);
+    } else {
+        return vdivq_f64(left, right);
+    }
+}
+
+template <PpcFloatTernaryOperation Operation>
+GALAXY_ALWAYS_INLINE Pair ternary_pair(Pair a, Pair c, Pair b) noexcept {
+    const double lane0 = ternary_op<Operation>(
+        vgetq_lane_f64(a, 0), vgetq_lane_f64(c, 0), vgetq_lane_f64(b, 0));
+    const double lane1 = ternary_op<Operation>(
+        vgetq_lane_f64(a, 1), vgetq_lane_f64(c, 1), vgetq_lane_f64(b, 1));
+    return vsetq_lane_f64(lane1, vdupq_n_f64(lane0), 1);
+}
+
+using SinglePair = float32x2_t;
+
+GALAXY_ALWAYS_INLINE SinglePair to_single_pair(Pair value) noexcept {
+    return vcvt_f32_f64(value);
+}
+
+GALAXY_ALWAYS_INLINE Pair from_single_pair(SinglePair value) noexcept {
+    return vcvt_f64_f32(value);
+}
+
+template <PpcFloatBinaryOperation Operation>
+GALAXY_ALWAYS_INLINE SinglePair binary_single_pair(SinglePair left, SinglePair right) noexcept {
+    if constexpr (Operation == PpcFloatBinaryOperation::Add) {
+        return vadd_f32(left, right);
+    } else if constexpr (Operation == PpcFloatBinaryOperation::Subtract) {
+        return vsub_f32(left, right);
+    } else if constexpr (Operation == PpcFloatBinaryOperation::Multiply) {
+        return vmul_f32(left, right);
+    } else {
+        return vdiv_f32(left, right);
+    }
+}
+
+template <PpcFloatTernaryOperation Operation>
+GALAXY_ALWAYS_INLINE SinglePair ternary_single_pair(
+    SinglePair a, SinglePair c, SinglePair b) noexcept {
+    const float lane0 = ternary_op_f32<Operation>(
+        vget_lane_f32(a, 0), vget_lane_f32(c, 0), vget_lane_f32(b, 0));
+    const float lane1 = ternary_op_f32<Operation>(
+        vget_lane_f32(a, 1), vget_lane_f32(c, 1), vget_lane_f32(b, 1));
+    return vset_lane_f32(lane1, vdup_n_f32(lane0), 1);
+}
 #else
-#error "fast float paired singles require x86-64"
+#error "fast float paired singles require x86-64 or AArch64"
 #endif
 
 GALAXY_ALWAYS_INLINE void write_pair(

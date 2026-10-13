@@ -2,7 +2,9 @@ cmake_minimum_required(VERSION 3.24)
 project(NebulaRuntime VERSION 1.0.0 LANGUAGES C CXX)
 
 if(NOT WIN32)
-    message(FATAL_ERROR "The first runtime milestone targets Windows x64 only.")
+    # Linux/macOS/iOS: only the ported runtime pieces build so far.
+    include(cmake/portable_runtime.cmake)
+    return()
 endif()
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)

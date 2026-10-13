@@ -13,6 +13,9 @@
 namespace galaxy::host::flat_guest_memory {
 
 static_assert(sizeof(void*) == 8, "flat guest memory requires a 64-bit host");
+// Windows places the view at exactly kGuestBase. POSIX hosts (Linux, macOS,
+// iOS) ask for it but accept any address, since iOS in particular cannot map
+// that high; use guest_base() for the real address on every platform.
 inline constexpr std::uintptr_t kGuestBase = 0x0000100000000000ull;
 inline constexpr std::uint64_t kGuestSpaceSize = 0x100000000ull;
 inline constexpr std::uint32_t kMem1Size = 0x01800000u;
@@ -24,6 +27,11 @@ inline constexpr std::uint32_t kMem2Size = 0x04000000u;
 // kGuestBase + guest_address loads. It throws if exact placement is unavailable.
 void initialize();
 [[nodiscard]] bool is_initialized() noexcept;
+// Start of the 4 GiB guest view (null before initialize()).
+[[nodiscard]] std::byte* guest_base() noexcept;
+// Identifier of the calling thread, the value FaultAccessCallbacks::thread_id
+// expects (GetCurrentThreadId on Windows).
+[[nodiscard]] unsigned long current_thread_id() noexcept;
 [[nodiscard]] std::byte* mem1_host_view() noexcept;
 [[nodiscard]] std::byte* mem2_host_view() noexcept;
 

@@ -1,0 +1,52 @@
+name: Apple port
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-arm64:
+    name: Linux ARM64 (build + tests)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang ninja-build cmake
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  macos-arm64:
+    name: macOS Apple Silicon (build + tests)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        run: brew install ninja
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_OSX_ARCHITECTURES=arm64
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  ios-arm64:
+    name: iOS arm64 (compile only)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Ninja
+        run: brew install ninja
+      - name: Configure
+        run: >
+          cmake -S . -B build-ios -G Ninja
+          -DCMAKE_SYSTEM_NAME=iOS
+          -DCMAKE_OSX_ARCHITECTURES=arm64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0
+          -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
+      - name: Build
+        run: cmake --build build-ios

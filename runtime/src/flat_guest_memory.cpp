@@ -8,6 +8,9 @@
 // executable or deferred-read hooks yet, and strict unmapped failure. No handler commits an unmapped
 // guest page.
 
+#if defined(_WIN32)
+// The POSIX implementation (Linux, macOS, iOS) is flat_guest_memory_posix.cpp.
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -924,6 +927,14 @@ bool is_initialized() noexcept {
     return g_initialized.load(std::memory_order_acquire);
 }
 
+std::byte* guest_base() noexcept {
+    return is_initialized() ? g_guest_base : nullptr;
+}
+
+unsigned long current_thread_id() noexcept {
+    return GetCurrentThreadId();
+}
+
 std::byte* mem1_host_view() noexcept {
     return is_initialized() ? g_mem1.host_view : nullptr;
 }
@@ -974,3 +985,5 @@ bool OwnerLease::acquire() {
 }
 
 }  // namespace galaxy::host::flat_guest_memory
+
+#endif  // _WIN32

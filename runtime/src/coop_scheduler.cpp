@@ -1,12 +1,6 @@
 #include "galaxy/coop_scheduler.h"
 
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-
-#include <xmmintrin.h>
+#include "galaxy/host_fiber.h"
 
 #include <bit>
 #include <cstdio>
@@ -22,8 +16,8 @@ constexpr std::uint32_t kDefaultSwitchThreadCallback = 0x804AAC08u;
 
 // A translated thread's native frames: deep scene traversals stay well below
 // this; the reserve is address space only.
-constexpr SIZE_T kFiberCommit = 256u * 1024u;
-constexpr SIZE_T kFiberReserve = 8u * 1024u * 1024u;
+constexpr std::size_t kFiberCommit = 256u * 1024u;
+constexpr std::size_t kFiberReserve = 8u * 1024u * 1024u;
 
 std::uint32_t leading_zeros(std::uint32_t value) noexcept {
     return static_cast<std::uint32_t>(std::countl_zero(value));
@@ -113,11 +107,11 @@ Scheduler::Scheduler(Host host, GuestRam ram, PpcContext* shared_context)
 
 Scheduler::~Scheduler() {
     for (void* handle : retired_) {
-        if (handle != nullptr && handle != GetCurrentFiber()) DeleteFiber(handle);
+        if (handle != nullptr && handle != host::fiber_current()) host::fiber_delete(handle);
     }
     for (auto& [thread, fiber] : fibers_) {
-        if (fiber.handle != nullptr && !fiber.boot && fiber.handle != GetCurrentFiber()) {
-            DeleteFiber(fiber.handle);
+        if (fiber.handle != nullptr && !fiber.boot && fiber.handle != host::fiber_current()) {
+            host::fiber_delete(fiber.handle);
         }
     }
 }
@@ -126,18 +120,19 @@ void Scheduler::attach_boot_fiber() {
     if (boot_handle_ != nullptr) return;
     // Float switching keeps MXCSR (flush-to-zero, rounding) per fiber; new
     // fibers start from the simulation thread's mode.
-    boot_handle_ = ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH);
+    boot_handle_ = host::fiber_convert_thread();
     if (boot_handle_ == nullptr) {
         throw std::runtime_error(
-            "ConvertThreadToFiberEx failed: " + std::to_string(GetLastError()));
+            "converting the simulation thread to a fiber failed: " +
+            std::to_string(host::last_error()));
     }
-    mxcsr_ = _mm_getcsr();
+    fp_control_ = host::fp_control_get();
 }
 
 ChainState& Scheduler::running_chain() noexcept {
     if (running_thread_ != 0u) {
         const auto it = fibers_.find(running_thread_);
-        if (it != fibers_.end() && it->second.handle == GetCurrentFiber()) {
+        if (it != fibers_.end() && it->second.handle == host::fiber_current()) {
             return it->second.chain;
         }
     }
@@ -202,13 +197,13 @@ void Scheduler::select_thread(bool yield) {
         // The fiber executing SelectThread belongs to the current thread.
         Fiber& self = fibers_[current];
         if (self.handle == nullptr) {
-            self.handle = GetCurrentFiber();
+            self.handle = host::fiber_current();
             self.started = true;
             self.boot = self.handle == boot_handle_;
             if (self.boot) {
                 boot_thread_ = current;
             }
-        } else if (self.handle != GetCurrentFiber()) {
+        } else if (self.handle != host::fiber_current()) {
             throw std::runtime_error(
                 "cooperative SelectThread: current thread " + hex(current) +
                 " belongs to another fiber");
@@ -264,7 +259,7 @@ void Scheduler::select_thread(bool yield) {
     // context; the "load" is the fiber switch below.
     call_switch_callback(ram_.load32(os::kCurrentThread), next);
     set_current(next, next);
-    if (next != running_thread_ || fibers_[next].handle != GetCurrentFiber()) {
+    if (next != running_thread_ || fibers_[next].handle != host::fiber_current()) {
         switch_to(next);
     }
 }
@@ -273,7 +268,7 @@ void Scheduler::switch_to(std::uint32_t next) {
     ChainState* const parked = &running_chain();
     if (running_thread_ != 0u) {
         Fiber& self = fibers_[running_thread_];
-        if (self.handle == GetCurrentFiber()) {
+        if (self.handle == host::fiber_current()) {
             save_thread_registers(*context_, self.saved);
             self.started = true;
         }
@@ -282,13 +277,13 @@ void Scheduler::switch_to(std::uint32_t next) {
     Fiber& target = fibers_[next];
     if (target.handle == nullptr) {
         auto* start = new FiberStart{this, next};
-        target.handle = CreateFiberEx(kFiberCommit, kFiberReserve, FIBER_FLAG_FLOAT_SWITCH,
-                                      &Scheduler::fiber_entry, start);
+        target.handle = host::fiber_create(kFiberCommit, kFiberReserve,
+                                           &Scheduler::fiber_entry, start);
         if (target.handle == nullptr) {
             delete start;
             throw std::runtime_error(
-                "CreateFiberEx failed for guest thread " + hex(next) + ": " +
-                std::to_string(GetLastError()));
+                "creating the fiber for guest thread " + hex(next) + " failed: " +
+                std::to_string(host::last_error()));
         }
         target.started = false;
         target.chain = {};
@@ -299,12 +294,12 @@ void Scheduler::switch_to(std::uint32_t next) {
     host_.exchange_chain(host_.user, *parked, target.chain);
     running_thread_ = next;
     ++switches_;
-    SwitchToFiber(target.handle);
+    host::fiber_switch(target.handle);
 
     // Resumed: the switching fiber restored this thread's registers and chain.
     reap_exited();
     release_parked();
-    if (fiber_error_ != nullptr && GetCurrentFiber() == boot_handle_) {
+    if (fiber_error_ != nullptr && host::fiber_current() == boot_handle_) {
         std::exception_ptr error = fiber_error_;
         fiber_error_ = nullptr;
         std::rethrow_exception(error);
@@ -320,17 +315,17 @@ void Scheduler::return_to_boot() noexcept {
             : unowned_chain_;
     host_.exchange_chain(host_.user, parked, resumed);
     running_thread_ = boot_thread_;
-    SwitchToFiber(boot_handle_);
+    host::fiber_switch(boot_handle_);
     // The boot fiber never resumes a fiber that reported a failure.
     std::terminate();
 }
 
-void __stdcall Scheduler::fiber_entry(void* parameter) {
+void Scheduler::fiber_entry(void* parameter) {
     auto* start = static_cast<FiberStart*>(parameter);
     Scheduler* const scheduler = start->scheduler;
     const std::uint32_t thread = start->thread;
     delete start;
-    _mm_setcsr(scheduler->mxcsr_);
+    host::fp_control_set(scheduler->fp_control_);
     try {
         scheduler->host_.run_new_thread(scheduler->host_.user, thread, scheduler->context_);
         throw std::runtime_error(
@@ -345,7 +340,7 @@ void __stdcall Scheduler::fiber_entry(void* parameter) {
 void Scheduler::on_thread_created(std::uint32_t thread) {
     const auto it = fibers_.find(thread);
     if (it == fibers_.end()) return;
-    if (it->second.handle != nullptr && it->second.handle != GetCurrentFiber() &&
+    if (it->second.handle != nullptr && it->second.handle != host::fiber_current() &&
         !it->second.boot) {
         retired_.push_back(it->second.handle);
     }
@@ -357,7 +352,7 @@ void Scheduler::on_thread_created(std::uint32_t thread) {
 // runs again only through OSCreateThread, which starts a new fiber: its parked
 // fiber is released.
 void Scheduler::reap_exited() {
-    void* const current = GetCurrentFiber();
+    void* const current = host::fiber_current();
     for (auto it = fibers_.begin(); it != fibers_.end();) {
         const Fiber& fiber = it->second;
         const std::uint16_t state = ram_.load16(it->first + os::kThreadState);
@@ -373,10 +368,10 @@ void Scheduler::reap_exited() {
 
 void Scheduler::release_parked() {
     if (retired_.empty()) return;
-    void* const current = GetCurrentFiber();
+    void* const current = host::fiber_current();
     for (auto it = retired_.begin(); it != retired_.end();) {
         if (*it != current) {
-            DeleteFiber(*it);
+            host::fiber_delete(*it);
             it = retired_.erase(it);
         } else {
             ++it;
