@@ -29,7 +29,7 @@ On a non-Windows host the top-level `CMakeLists.txt` includes
    control (MXCSR+x87 CW / FPCR), matching `FIBER_FLAG_FLOAT_SWITCH`.
    `coop_scheduler.cpp` uses it. FTZ for fast float: `fp_enable_flush_denormals()`.
 3. **Flat guest memory on POSIX** — `flat_guest_memory_posix.cpp`: 4 GiB view
-   with MEM1/MEM2 at all six aliases (memfd on Linux, `mach_vm_remap` on
+   with MEM1/MEM2 at all six aliases (memfd on Linux, `vm_remap` on
    Apple), any base address (`guest_base()` replaces `kGuestBase` for
    callers), and an **AArch64 fastmem fault handler** (SIGSEGV/SIGBUS) that
    decodes LDR/STR/LDP/STP/LDUR/pre-/post-index/register-offset, SIMD&FP

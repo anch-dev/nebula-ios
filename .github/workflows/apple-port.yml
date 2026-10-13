@@ -49,4 +49,7 @@ jobs:
           -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0
           -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
       - name: Build
-        run: cmake --build build-ios
+        run: cmake --build build-ios 2>&1 | tee build-ios.log; exit ${PIPESTATUS[0]}
+      - name: Surface errors
+        if: failure()
+        run: grep -E "error|Error" build-ios.log | head -40 | sed 's/^/::error::/' || true

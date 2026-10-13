@@ -7,7 +7,7 @@
 // Mapping:
 //   Linux        memfd sections, MAP_FIXED|MAP_SHARED views over a PROT_NONE
 //                reservation.
-//   Apple        mach_vm_allocate host views, mach_vm_remap (copy = FALSE)
+//   Apple        vm_allocate host views, vm_remap (copy = FALSE)
 //                aliases over the reservation. iOS has no shm/memfd in the app
 //                sandbox, and remapping within the task is allowed.
 // The reservation asks for kGuestBase but takes any address: iOS limits the
@@ -42,7 +42,6 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <sys/ucontext.h>
 #else
 #include <sys/syscall.h>
@@ -97,33 +96,35 @@ std::byte* reserve_guest_space() {
 #if defined(__APPLE__)
 
 std::byte* create_section(std::uint32_t size) {
-    mach_vm_address_t address = 0u;
+    // vm_* rather than mach_vm_*: <mach/mach_vm.h> is unavailable on iOS,
+    // and vm_address_t is 64-bit on arm64.
+    vm_address_t address = 0u;
     const kern_return_t result =
-        mach_vm_allocate(mach_task_self(), &address, size, VM_FLAGS_ANYWHERE);
+        vm_allocate(mach_task_self(), &address, size, VM_FLAGS_ANYWHERE);
     if (result != KERN_SUCCESS) {
-        throw std::runtime_error("mach_vm_allocate for guest RAM failed (kern_return " +
+        throw std::runtime_error("vm_allocate for guest RAM failed (kern_return " +
                                  std::to_string(result) + ')');
     }
     return reinterpret_cast<std::byte*>(address);
 }
 
 void map_guest_alias(std::byte* section, std::uint32_t guest_address, std::uint32_t size) {
-    mach_vm_address_t target = reinterpret_cast<mach_vm_address_t>(g_guest_base + guest_address);
+    vm_address_t target = reinterpret_cast<vm_address_t>(g_guest_base + guest_address);
     vm_prot_t current = VM_PROT_NONE;
     vm_prot_t maximum = VM_PROT_NONE;
-    const kern_return_t result = mach_vm_remap(
+    const kern_return_t result = vm_remap(
         mach_task_self(), &target, size, 0u, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
-        mach_task_self(), reinterpret_cast<mach_vm_address_t>(section),
+        mach_task_self(), reinterpret_cast<vm_address_t>(section),
         FALSE, &current, &maximum, VM_INHERIT_NONE);
     if (result != KERN_SUCCESS) {
-        throw std::runtime_error("mach_vm_remap guest alias failed (kern_return " +
+        throw std::runtime_error("vm_remap guest alias failed (kern_return " +
                                  std::to_string(result) + ')');
     }
-    if (target != reinterpret_cast<mach_vm_address_t>(g_guest_base + guest_address)) {
-        throw std::runtime_error("mach_vm_remap placed a guest alias away from its address");
+    if (target != reinterpret_cast<vm_address_t>(g_guest_base + guest_address)) {
+        throw std::runtime_error("vm_remap placed a guest alias away from its address");
     }
     if ((current & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) {
-        throw std::runtime_error("mach_vm_remap guest alias is not read/write");
+        throw std::runtime_error("vm_remap guest alias is not read/write");
     }
 }
 
