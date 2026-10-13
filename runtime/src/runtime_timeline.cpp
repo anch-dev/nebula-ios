@@ -24,7 +24,9 @@
 namespace {
 using HANDLE = void*;
 using DWORD = unsigned long;
-constexpr int FALSE = 0;
+#ifndef FALSE
+#define FALSE 0  // Apple's mach headers already define it
+#endif
 inline HANDLE CreateEventW(void*, int, int, void*) noexcept {
     return galaxy::host::event_create();
 }
