@@ -20,8 +20,6 @@
 
 #if (defined(__x86_64__) || defined(_M_X64)) && !defined(_MSC_VER)
 #include <immintrin.h>
-#elif defined(__aarch64__) || defined(_M_ARM64)
-#include <arm_neon.h>
 #endif
 
 #ifndef GALAXY_FAST_FLOAT
@@ -1159,103 +1157,102 @@ GALAXY_ALWAYS_INLINE SinglePair ternary_single_pair(
         ternary_op_f32<Operation>(a_lanes[1], c_lanes[1], b_lanes[1]), 0.0F, 0.0F);
 #endif
 }
-#elif defined(__aarch64__) || defined(_M_ARM64)
-// AArch64 (Apple Silicon, iOS, ARM Linux): the same lane layout on NEON.
-// Arithmetic is IEEE binary64/binary32 with the host's round-to-nearest, as on
-// SSE2. Fused forms go lane by lane through ternary_op, the exact scalar
+#elif defined(__GNUC__) || defined(__clang__)
+// Every other host (AArch64: Apple Silicon, iOS, ARM Linux) uses GCC/clang
+// vector extensions, which lower to NEON on AArch64. <arm_neon.h> is avoided
+// on purpose: it defines global float32_t/float64_t, which collide with
+// Berkeley SoftFloat's types in translation units that include both.
+// Arithmetic is IEEE binary64/binary32 in the host's rounding mode, as on
+// SSE2; fused forms go lane by lane through ternary_op, the exact scalar
 // definition the non-FMA x86 build uses.
-using Pair = float64x2_t;
+typedef double Pair __attribute__((vector_size(16)));
+typedef std::uint64_t PairBits __attribute__((vector_size(16)));
 
 GALAXY_ALWAYS_INLINE Pair make_pair(std::uint64_t ps0, std::uint64_t ps1) noexcept {
-    return vreinterpretq_f64_u64(vcombine_u64(vcreate_u64(ps0), vcreate_u64(ps1)));
+    const PairBits bits = {ps0, ps1};
+    return reinterpret_cast<const Pair&>(bits);
 }
 
 template <PairedLane Lane>
 GALAXY_ALWAYS_INLINE Pair select_lanes(std::uint64_t ps0, std::uint64_t ps1) noexcept {
     if constexpr (Lane == PairedLane::Lane0) {
-        return vdupq_n_f64(as_f64(ps0));
+        return Pair{as_f64(ps0), as_f64(ps0)};
     } else if constexpr (Lane == PairedLane::Lane1) {
-        return vdupq_n_f64(as_f64(ps1));
+        return Pair{as_f64(ps1), as_f64(ps1)};
     } else {
         return make_pair(ps0, ps1);
     }
 }
 
 GALAXY_ALWAYS_INLINE std::uint64_t lane0_bits(Pair value) noexcept {
-    return vgetq_lane_u64(vreinterpretq_u64_f64(value), 0);
+    return as_bits(value[0]);
 }
 
 GALAXY_ALWAYS_INLINE std::uint64_t lane1_bits(Pair value) noexcept {
-    return vgetq_lane_u64(vreinterpretq_u64_f64(value), 1);
+    return as_bits(value[1]);
 }
 
+typedef float SinglePair __attribute__((vector_size(8)));
+
 GALAXY_ALWAYS_INLINE Pair round_to_single(Pair value) noexcept {
-    return vcvt_f64_f32(vcvt_f32_f64(value));
+    return __builtin_convertvector(__builtin_convertvector(value, SinglePair), Pair);
 }
 
 GALAXY_ALWAYS_INLINE Pair round_multiplier_25(Pair value) noexcept {
-    const uint64x2_t bits = vreinterpretq_u64_f64(value);
-    return vreinterpretq_f64_u64(vandq_u64(
-        vaddq_u64(bits, vdupq_n_u64(0x0000000008000000ull)),
-        vdupq_n_u64(0xFFFFFFFFF0000000ull)));
+    PairBits bits = reinterpret_cast<const PairBits&>(value);
+    bits = (bits + PairBits{0x0000000008000000ull, 0x0000000008000000ull}) &
+           PairBits{0xFFFFFFFFF0000000ull, 0xFFFFFFFFF0000000ull};
+    return reinterpret_cast<const Pair&>(bits);
 }
 
 template <PpcFloatBinaryOperation Operation>
 GALAXY_ALWAYS_INLINE Pair binary_pair(Pair left, Pair right) noexcept {
     if constexpr (Operation == PpcFloatBinaryOperation::Add) {
-        return vaddq_f64(left, right);
+        return left + right;
     } else if constexpr (Operation == PpcFloatBinaryOperation::Subtract) {
-        return vsubq_f64(left, right);
+        return left - right;
     } else if constexpr (Operation == PpcFloatBinaryOperation::Multiply) {
-        return vmulq_f64(left, right);
+        return left * right;
     } else {
-        return vdivq_f64(left, right);
+        return left / right;
     }
 }
 
 template <PpcFloatTernaryOperation Operation>
 GALAXY_ALWAYS_INLINE Pair ternary_pair(Pair a, Pair c, Pair b) noexcept {
-    const double lane0 = ternary_op<Operation>(
-        vgetq_lane_f64(a, 0), vgetq_lane_f64(c, 0), vgetq_lane_f64(b, 0));
-    const double lane1 = ternary_op<Operation>(
-        vgetq_lane_f64(a, 1), vgetq_lane_f64(c, 1), vgetq_lane_f64(b, 1));
-    return vsetq_lane_f64(lane1, vdupq_n_f64(lane0), 1);
+    return Pair{ternary_op<Operation>(a[0], c[0], b[0]),
+                ternary_op<Operation>(a[1], c[1], b[1])};
 }
 
-using SinglePair = float32x2_t;
-
 GALAXY_ALWAYS_INLINE SinglePair to_single_pair(Pair value) noexcept {
-    return vcvt_f32_f64(value);
+    return __builtin_convertvector(value, SinglePair);
 }
 
 GALAXY_ALWAYS_INLINE Pair from_single_pair(SinglePair value) noexcept {
-    return vcvt_f64_f32(value);
+    return __builtin_convertvector(value, Pair);
 }
 
 template <PpcFloatBinaryOperation Operation>
 GALAXY_ALWAYS_INLINE SinglePair binary_single_pair(SinglePair left, SinglePair right) noexcept {
     if constexpr (Operation == PpcFloatBinaryOperation::Add) {
-        return vadd_f32(left, right);
+        return left + right;
     } else if constexpr (Operation == PpcFloatBinaryOperation::Subtract) {
-        return vsub_f32(left, right);
+        return left - right;
     } else if constexpr (Operation == PpcFloatBinaryOperation::Multiply) {
-        return vmul_f32(left, right);
+        return left * right;
     } else {
-        return vdiv_f32(left, right);
+        return left / right;
     }
 }
 
 template <PpcFloatTernaryOperation Operation>
 GALAXY_ALWAYS_INLINE SinglePair ternary_single_pair(
     SinglePair a, SinglePair c, SinglePair b) noexcept {
-    const float lane0 = ternary_op_f32<Operation>(
-        vget_lane_f32(a, 0), vget_lane_f32(c, 0), vget_lane_f32(b, 0));
-    const float lane1 = ternary_op_f32<Operation>(
-        vget_lane_f32(a, 1), vget_lane_f32(c, 1), vget_lane_f32(b, 1));
-    return vset_lane_f32(lane1, vdup_n_f32(lane0), 1);
+    return SinglePair{ternary_op_f32<Operation>(a[0], c[0], b[0]),
+                      ternary_op_f32<Operation>(a[1], c[1], b[1])};
 }
 #else
-#error "fast float paired singles require x86-64 or AArch64"
+#error "fast float paired singles need SSE2 or GCC/clang vector extensions"
 #endif
 
 GALAXY_ALWAYS_INLINE void write_pair(

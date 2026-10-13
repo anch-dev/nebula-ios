@@ -1,7 +1,14 @@
 #include "galaxy/runtime_settings.h"
 #include "galaxy/input_bindings.h"
 
+#include "galaxy/platform_compat.h"
+#if defined(_WIN32)
 #include <Windows.h>
+#else
+#include <chrono>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include <cstdlib>
 #include <clocale>
@@ -41,6 +48,21 @@ private:
     std::string old_value_;
 };
 
+#if !defined(_WIN32)
+// POSIX paths are narrow; the settings path variable is an ordinary one.
+using ScopedWideEnv = ScopedEnv;
+#define GALAXY_TEST_PATH_ENV "GALAXY_RUNTIME_SETTINGS_PATH"
+void set_settings_path_env(const char* value) { (void)_putenv_s("GALAXY_RUNTIME_SETTINGS_PATH", value); }
+unsigned long process_id() { return static_cast<unsigned long>(getpid()); }
+unsigned long long ticks() {
+    return static_cast<unsigned long long>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+}
+#else
+#define GALAXY_TEST_PATH_ENV L"GALAXY_RUNTIME_SETTINGS_PATH"
+void set_settings_path_env(const wchar_t* value) { (void)_wputenv_s(L"GALAXY_RUNTIME_SETTINGS_PATH", value); }
+unsigned long process_id() { return GetCurrentProcessId(); }
+unsigned long long ticks() { return GetTickCount64(); }
 class ScopedWideEnv {
 public:
     explicit ScopedWideEnv(const wchar_t* name) : name_(name) {
@@ -70,7 +92,27 @@ private:
     bool had_old_ = false;
     std::wstring old_value_;
 };
+#endif
 
+#if !defined(_WIN32)
+// POSIX: the test is single-threaded, so the process locale is snapshotted
+// and restored around the test instead of isolated per thread.
+class ScopedNumericLocale {
+public:
+    ScopedNumericLocale() {
+        const char* previous = std::setlocale(LC_NUMERIC, nullptr);
+        if (previous == nullptr) {
+            throw std::runtime_error("cannot snapshot test numeric locale");
+        }
+        old_value_ = previous;
+    }
+    ~ScopedNumericLocale() { (void)std::setlocale(LC_NUMERIC, old_value_.c_str()); }
+    ScopedNumericLocale(const ScopedNumericLocale&) = delete;
+    ScopedNumericLocale& operator=(const ScopedNumericLocale&) = delete;
+private:
+    std::string old_value_;
+};
+#else
 class ScopedNumericLocale {
 public:
     ScopedNumericLocale() : old_thread_mode_(_configthreadlocale(_ENABLE_PER_THREAD_LOCALE)) {
@@ -98,6 +140,7 @@ private:
     int old_thread_mode_;
     std::string old_value_;
 };
+#endif
 
 bool expect(bool condition, const char* message) {
     if (!condition) {
@@ -127,7 +170,7 @@ std::string read_text(const std::filesystem::path& path) {
 int main() {
     bool passed = true;
 
-    const ScopedWideEnv scoped_path(L"GALAXY_RUNTIME_SETTINGS_PATH");
+    const ScopedWideEnv scoped_path(GALAXY_TEST_PATH_ENV);
     const ScopedEnv scoped_input("GALAXY_INPUT_MODE");
     const ScopedEnv scoped_master("GALAXY_AUDIO_MASTER_GAIN");
     const ScopedEnv scoped_music("GALAXY_AUDIO_MUSIC_GAIN");
@@ -139,14 +182,13 @@ int main() {
     const std::filesystem::path root =
         std::filesystem::temp_directory_path() /
         ("galaxy_runtime_settings_tests_" +
-         std::to_string(GetCurrentProcessId()) + "_" +
-         std::to_string(GetTickCount64()));
+         std::to_string(process_id()) + "_" + std::to_string(ticks()));
     const std::filesystem::path settings_path = root / "runtime_settings.ini";
     if (!std::filesystem::create_directory(root)) {
         std::cerr << "FAILED: fixture directory was not newly created\n";
         return 1;
     }
-    _wputenv_s(L"GALAXY_RUNTIME_SETTINGS_PATH", settings_path.c_str());
+    set_settings_path_env(settings_path.c_str());
 
     _putenv_s("GALAXY_INPUT_MODE", "");
     _putenv_s("GALAXY_AUDIO_MASTER_GAIN", "");
@@ -317,6 +359,19 @@ int main() {
 
     _putenv_s("GALAXY_INPUT_MODE", "");
     write_text(settings_path, "sentinel=old\n");
+#if !defined(_WIN32)
+    // POSIX cannot lock a file against rename; a read-only directory makes
+    // the replacement fail instead (root ignores the mode, so skip there).
+    if (geteuid() != 0) {
+        passed &= expect(chmod(root.c_str(), 0555) == 0,
+            "runtime settings directory can be made read-only for failure injection");
+        passed &= expect(
+            !galaxy::save_runtime_settings_to_file() &&
+                read_text(settings_path) == "sentinel=old\n",
+            "runtime settings replace failure preserves the complete old file");
+        (void)chmod(root.c_str(), 0755);
+    }
+#else
     HANDLE locked = CreateFileW(
         settings_path.c_str(),
         GENERIC_READ,
@@ -335,6 +390,7 @@ int main() {
     if (locked != INVALID_HANDLE_VALUE) {
         (void)CloseHandle(locked);
     }
+#endif
     passed &= expect(
         galaxy::save_runtime_settings_to_file() &&
             read_text(settings_path).find("input_mode=auto") !=
@@ -346,8 +402,8 @@ int main() {
         "runtime settings atomically replace the destination with ambience persistence after recovery");
     std::size_t temp_count = 0u;
     for (const auto& entry : std::filesystem::directory_iterator(root)) {
-        if (entry.path().filename().wstring().find(L".tmp.") !=
-            std::wstring::npos) {
+        if (entry.path().filename().string().find(".tmp.") !=
+            std::string::npos) {
             ++temp_count;
         }
     }
@@ -438,6 +494,22 @@ int main() {
         "an overlong logical line rejects the whole file before publication");
 
     write_text(settings_path, "input_mode=real_wiimote\n");
+#if !defined(_WIN32)
+    // POSIX: an unreadable file stands in for a share-locked one (not as root).
+    if (geteuid() != 0 && chmod(settings_path.c_str(), 0) == 0) {
+        bool read_rejected = false;
+        try {
+            galaxy::load_runtime_settings_from_file();
+        } catch (const std::exception&) {
+            read_rejected = true;
+        }
+        (void)chmod(settings_path.c_str(), 0644);
+        passed &= expect(
+            read_rejected &&
+                galaxy::get_runtime_input_mode_state().generation == before_failed_load.generation,
+            "file access error preserves the prior published settings generation");
+    }
+#else
     HANDLE unreadable = CreateFileW(
         settings_path.c_str(), GENERIC_READ, 0u, nullptr, OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -455,6 +527,7 @@ int main() {
                 galaxy::get_runtime_input_mode_state().generation == before_failed_load.generation,
             "file access error preserves the prior published settings generation");
     }
+#endif
 
     galaxy::RuntimeSettings invalid_mode = galaxy::get_runtime_settings();
     invalid_mode.input_mode = static_cast<galaxy::RuntimeInputMode>(99u);
@@ -485,15 +558,17 @@ int main() {
 
     const auto unicode_path = root / L"\u6e38\u620f-settings.ini";
     write_text(unicode_path, "audio_master_gain=0.375\n");
-    _wputenv_s(L"GALAXY_RUNTIME_SETTINGS_PATH", unicode_path.c_str());
+    set_settings_path_env(unicode_path.c_str());
     galaxy::load_runtime_settings_from_file();
     passed &= expect(
         galaxy::get_runtime_settings().audio.master == 0.375f &&
             galaxy::save_runtime_settings_to_file(),
         "wide settings override preserves the actual Unicode destination");
 
+#if defined(_WIN32)
+    // MAX_PATH applies to the Windows override only.
     const std::wstring too_long_override(300u, L'x');
-    _wputenv_s(L"GALAXY_RUNTIME_SETTINGS_PATH", too_long_override.c_str());
+    set_settings_path_env(too_long_override.c_str());
     bool override_rejected = false;
     try {
         galaxy::load_runtime_settings_from_file();
@@ -506,11 +581,23 @@ int main() {
         passed &= expect(!galaxy::save_runtime_settings_to_file(),
             "invalid override save fails without selecting a fallback destination");
     }
-    _wputenv_s(L"GALAXY_RUNTIME_SETTINGS_PATH", settings_path.c_str());
+#endif
+    set_settings_path_env(settings_path.c_str());
 
     {
         // Live audio reload: only gains follow the file, and only when its
         // last-write time changes.
+#if !defined(_WIN32)
+        const auto stamp = [&settings_path](std::uint64_t file_time) {
+            std::error_code error;
+            std::filesystem::last_write_time(settings_path,
+                std::filesystem::file_time_type(
+                    std::filesystem::file_time_type::duration(
+                        static_cast<std::int64_t>(file_time))),
+                error);
+            return !error;
+        };
+#else
         const auto stamp = [&settings_path](std::uint64_t file_time) {
             const HANDLE file = CreateFileW(settings_path.c_str(), FILE_WRITE_ATTRIBUTES,
                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -520,6 +607,7 @@ int main() {
             if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
             return ok;
         };
+#endif
         write_text(settings_path, "input_mode=keyboard_mouse\ncontrols_version=2\naudio_music_gain=0.5\n");
         passed &= expect(stamp(133'000'000'000'000'000ull), "fixture time set");
         galaxy::load_runtime_settings_from_file();

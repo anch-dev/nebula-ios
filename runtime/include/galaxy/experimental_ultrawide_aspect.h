@@ -1,6 +1,7 @@
 #pragma once
 
 #include "galaxy/content_viewport.h"
+#include "galaxy/platform_compat.h"
 
 #include <atomic>
 #include <algorithm>

@@ -11289,10 +11289,8 @@ GuestAddressSpace::GuestAddressSpace(
                     "flat guest RAM view does not match the guest memory owner");
             }
         }
-        memory_.flat_guest_read_base = reinterpret_cast<const std::byte*>(
-            flat_guest_memory::kGuestBase);
-        memory_.flat_guest_base = reinterpret_cast<std::byte*>(
-            flat_guest_memory::kGuestBase);
+        memory_.flat_guest_read_base = flat_guest_memory::guest_base();
+        memory_.flat_guest_base = flat_guest_memory::guest_base();
     }
     // Publish the live gather buffer only when no diagnostic observes
     // individual gather-pipe writes; every such flag routes generated stores

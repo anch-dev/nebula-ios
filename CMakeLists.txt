@@ -1,12 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 project(NebulaRuntime VERSION 1.0.0 LANGUAGES C CXX)
 
-if(NOT WIN32)
-    # Linux/macOS/iOS: only the ported runtime pieces build so far.
-    include(cmake/portable_runtime.cmake)
-    return()
-endif()
-
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "Nebula requires a 64-bit build.")
 endif()
@@ -281,6 +275,13 @@ target_include_directories(
     INTERFACE
         "${CMAKE_CURRENT_SOURCE_DIR}/runtime/include"
 )
+
+if(NOT WIN32)
+    # Linux/macOS/iOS: everything above (SoftFloat, PPC float, DSP ALU) is
+    # portable; cmake/portable_runtime.cmake adds the ported runtime pieces.
+    include(cmake/portable_runtime.cmake)
+    return()
+endif()
 
 add_library(galaxy_native_dsp STATIC runtime/src/native_dsp.cpp)
 target_link_libraries(galaxy_native_dsp PUBLIC galaxy_dsp_alu galaxy_runtime_abi)

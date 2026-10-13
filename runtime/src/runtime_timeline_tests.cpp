@@ -4,13 +4,17 @@
 #include "galaxy/psmtx_guard_trace.h"
 #include "galaxy/vi_boundary.h"
 
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#endif
 
+#if defined(_MSC_VER)
 #include <intrin.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -72,6 +76,7 @@ std::uint64_t read_atomic_manual_counter(void* user) noexcept {
         std::memory_order_acquire);
 }
 
+#if defined(_WIN32)
 struct WorkerPriorityCounter {
     DWORD owner_thread_id{};
     std::atomic_int observed_worker_priority{THREAD_PRIORITY_ERROR_RETURN};
@@ -89,6 +94,7 @@ std::uint64_t read_worker_priority_counter(void* user) noexcept {
     }
     return counter.value;
 }
+#endif
 
 bool expect(bool condition, std::string_view message) {
     if (!condition) {
@@ -2411,6 +2417,7 @@ bool broker_rephase_starts_at_next_unconsumed_input_deadline() {
     return passed;
 }
 
+#if defined(_WIN32)
 bool broker_configures_worker_priority_before_timeline_reads() {
     // This checks the explicit Win32 fallback, not the later dynamic MMCSS priority.
     // Games registration can legitimately change GetThreadPriority after
@@ -2490,6 +2497,7 @@ bool broker_configures_worker_priority_before_timeline_reads() {
     passed &= expect(restore_mmcss.restore(), "fallback-priority test restores its process environment");
     return passed;
 }
+#endif
 
 bool broker_replaces_and_cancels_one_shots_linearly() {
     using galaxy::timing::EventKind;
@@ -2727,7 +2735,9 @@ int main() {
     passed &= run_test("broker_only_latches_host_events", broker_only_latches_host_events);
     passed &= run_test("broker_periodic_rephase_discards_old_latch", broker_periodic_rephase_discards_old_latch);
     passed &= run_test("broker_rephase_starts_at_next_unconsumed_input_deadline", broker_rephase_starts_at_next_unconsumed_input_deadline);
+#if defined(_WIN32)
     passed &= run_test("broker_configures_worker_priority_before_timeline_reads", broker_configures_worker_priority_before_timeline_reads);
+#endif
     passed &= run_test("broker_replaces_and_cancels_one_shots_linearly", broker_replaces_and_cancels_one_shots_linearly);
     passed &= run_test("invalid_and_overflow_paths_fail_closed", invalid_and_overflow_paths_fail_closed);
     passed &= run_test("relative_vi_windows_are_exact_and_fail_closed", relative_vi_windows_are_exact_and_fail_closed);

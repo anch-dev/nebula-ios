@@ -1,8 +1,14 @@
 #include "galaxy/atomic_file.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#else
+#include <chrono>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include <filesystem>
 #include <fstream>
@@ -12,6 +18,17 @@
 #include <string>
 
 namespace {
+
+#if defined(_WIN32)
+unsigned long process_id() { return GetCurrentProcessId(); }
+unsigned long long ticks() { return GetTickCount64(); }
+#else
+unsigned long process_id() { return static_cast<unsigned long>(getpid()); }
+unsigned long long ticks() {
+    return static_cast<unsigned long long>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+}
+#endif
 
 bool expect(bool condition, const char* message) {
     if (!condition) {
@@ -32,8 +49,7 @@ bool test_collision_exception_preserves_unowned_sibling(
     // This runs before the ordinary writer uses sequence 1 in this process.
     const auto target = root / "collision-settings.ini";
     const auto collided = root /
-        (L"collision-settings.ini.tmp." +
-         std::to_wstring(GetCurrentProcessId()) + L".1");
+        ("collision-settings.ini.tmp." + std::to_string(process_id()) + ".1");
     std::filesystem::create_directories(root);
     {
         std::ofstream destination(target, std::ios::binary);
@@ -70,8 +86,7 @@ int main() {
     const std::filesystem::path root =
         std::filesystem::temp_directory_path() /
         ("galaxy_atomic_file_tests_" +
-         std::to_string(GetCurrentProcessId()) + "_" +
-         std::to_string(GetTickCount64()));
+         std::to_string(process_id()) + "_" + std::to_string(ticks()));
     const std::filesystem::path target = root / "settings.ini";
     if (!std::filesystem::create_directory(root)) {
         std::cerr << "FAILED: fixture directory was not newly created\n";
@@ -84,6 +99,7 @@ int main() {
         galaxy::io::write_text_file_atomically(target, "version=old\n"),
         "initial atomic write succeeds");
 
+#if defined(_WIN32)
     HANDLE locked = CreateFileW(
         target.c_str(),
         GENERIC_READ,
@@ -100,11 +116,22 @@ int main() {
     if (locked != INVALID_HANDLE_VALUE) {
         (void)CloseHandle(locked);
     }
+#else
+    // POSIX cannot lock a file against rename; a read-only directory makes
+    // the replacement fail instead (root ignores the mode, so skip there).
+    if (geteuid() != 0) {
+        passed &= expect(chmod(root.c_str(), 0555) == 0, "fixture directory made read-only");
+        passed &= expect(
+            !galaxy::io::write_text_file_atomically(target, "version=new\n") &&
+                read_text(target) == "version=old\n",
+            "replace failure preserves the complete old destination");
+        (void)chmod(root.c_str(), 0755);
+    }
+#endif
 
     std::size_t temporary_count = 0u;
     for (const auto& entry : std::filesystem::directory_iterator(root)) {
-        if (entry.path().filename().wstring().find(L".tmp.") !=
-            std::wstring::npos) {
+        if (entry.path().filename().string().find(".tmp.") != std::string::npos) {
             ++temporary_count;
         }
     }

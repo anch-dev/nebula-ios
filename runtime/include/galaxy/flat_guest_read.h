@@ -36,7 +36,7 @@ GALAXY_ALWAYS_INLINE T load_mapped(std::uint32_t address) noexcept {
     T value{};
     std::memcpy(
         &value,
-        reinterpret_cast<const void*>(flat_guest_memory::kGuestBase + address),
+        flat_guest_memory::guest_base() + address,
         sizeof(value));
     if constexpr (sizeof(T) == 2u) {
         return byte_swap_u16(value);

@@ -11,10 +11,10 @@
 #include "galaxy/synthetic_kpad_motion.h"
 #include "galaxy/tilt.h"
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <Windows.h>
+#include "galaxy/win32_portable.h"
+#if defined(_WIN32)
 #include <Xinput.h>
+#endif
 
 #include <algorithm>
 #include <array>

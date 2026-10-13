@@ -1,9 +1,8 @@
 #include "galaxy/input_bindings.h"
 #include "galaxy/rumble.h"
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <Windows.h>
+#include "galaxy/platform_compat.h"
+#include "galaxy/win32_portable.h"
 
 #include <algorithm>
 #include <atomic>

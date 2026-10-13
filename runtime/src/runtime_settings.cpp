@@ -2,10 +2,11 @@
 #include "galaxy/atomic_file.h"
 #include "galaxy/input_bindings.h"
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <Windows.h>
+#include "galaxy/platform_compat.h"
+#include "galaxy/win32_portable.h"
+#if defined(_WIN32)
 #include <Shlobj.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -142,6 +143,35 @@ void apply_kv(RuntimeSettings& settings, const char* key, const char* value) {
     }
 }
 
+#if !defined(_WIN32)
+// POSIX: GALAXY_RUNTIME_SETTINGS_PATH, else the per-user configuration
+// directory (Apple: ~/Library/Application Support; Linux: XDG config). On iOS
+// HOME is the app container.
+std::filesystem::path settings_path() {
+    const char* const override_value = std::getenv("GALAXY_RUNTIME_SETTINGS_PATH");
+    if (override_value != nullptr && override_value[0] != '\0') {
+        const std::filesystem::path path(override_value);
+        if (path.filename().empty()) {
+            throw std::runtime_error(
+                "GALAXY_RUNTIME_SETTINGS_PATH must name a settings file");
+        }
+        return path;
+    }
+    const char* const home = std::getenv("HOME");
+#if defined(__APPLE__)
+    if (home == nullptr || home[0] == '\0') return {};
+    return std::filesystem::path(home) / "Library" / "Application Support" / "Nebula" /
+           "runtime_settings.ini";
+#else
+    const char* const config = std::getenv("XDG_CONFIG_HOME");
+    if (config != nullptr && config[0] != '\0') {
+        return std::filesystem::path(config) / "Nebula" / "runtime_settings.ini";
+    }
+    if (home == nullptr || home[0] == '\0') return {};
+    return std::filesystem::path(home) / ".config" / "Nebula" / "runtime_settings.ini";
+#endif
+}
+#else
 std::filesystem::path settings_path() {
     wchar_t* override_value = nullptr;
     std::size_t override_length = 0u;
@@ -175,6 +205,7 @@ std::filesystem::path settings_path() {
     return std::filesystem::path(app_data) / L"Nebula" /
            L"runtime_settings.ini";
 }
+#endif
 
 // Files written by an older controls version carry that version's defaults:
 // those bindings move to the current defaults, and a version-1 file's
@@ -203,7 +234,12 @@ void parse_settings_file(RuntimeSettings& settings, input::ControlsConfig& contr
     unsigned controls_version = 0u;
 
     FILE* file = nullptr;
+#if defined(_WIN32)
     const int open_error = _wfopen_s(&file, path.c_str(), L"rb");
+#else
+    file = std::fopen(path.c_str(), "rb");
+    const int open_error = file == nullptr ? errno : 0;
+#endif
     const std::unique_ptr<FILE, decltype(&std::fclose)> owned_file(file, &std::fclose);
     if (open_error != 0 || file == nullptr) {
         if (open_error == ENOENT) {
@@ -315,6 +351,14 @@ namespace {
 std::uint64_t s_audio_settings_write_time = 0u;
 
 std::uint64_t settings_file_write_time(const std::filesystem::path& path) noexcept {
+#if !defined(_WIN32)
+    if (path.empty()) return 0u;
+    std::error_code error;
+    const auto time = std::filesystem::last_write_time(path, error);
+    if (error) return 0u;
+    const auto ticks = time.time_since_epoch().count();
+    return ticks == 0 ? 1u : static_cast<std::uint64_t>(ticks);
+#else
     WIN32_FILE_ATTRIBUTE_DATA data{};
     if (path.empty() ||
         !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
@@ -322,6 +366,7 @@ std::uint64_t settings_file_write_time(const std::filesystem::path& path) noexce
     }
     return (static_cast<std::uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32u) |
         data.ftLastWriteTime.dwLowDateTime;
+#endif
 }
 
 }  // namespace

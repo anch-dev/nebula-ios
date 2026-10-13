@@ -16257,8 +16257,10 @@ bool coop_scheduler_requested() {
 }
 
 const galaxy::coop::GuestRam& coop_ram() {
-    static const galaxy::coop::GuestRam ram{reinterpret_cast<std::byte*>(
-        galaxy::host::flat_guest_memory::kGuestBase)};
+    // POSIX hosts may place the view anywhere, so the base is read from the
+    // view (and again until it exists) instead of the fixed Windows address.
+    static galaxy::coop::GuestRam ram{};
+    if (ram.base == nullptr) ram.base = galaxy::host::flat_guest_memory::guest_base();
     return ram;
 }
 
@@ -33101,7 +33103,7 @@ int wmain(int argc, wchar_t** argv) {
                 address, size, true, const_cast<std::byte*>(image));
         };
         callbacks.user = state.address_space;
-        callbacks.thread_id = GetCurrentThreadId();
+        callbacks.thread_id = galaxy::host::flat_guest_memory::current_thread_id();
         galaxy::host::flat_guest_memory::install_fault_handler(callbacks);
     }
     address_space.guest_memory()->notify_write = &notify_guest_memory_write;

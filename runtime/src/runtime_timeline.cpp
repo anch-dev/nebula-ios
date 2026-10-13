@@ -1,11 +1,44 @@
 #include "galaxy/runtime_timeline.h"
+#include "galaxy/platform_compat.h"
 
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #pragma comment(lib, "Synchronization.lib")
+#else
+// POSIX (Linux, macOS, iOS): a monotonic clock replaces QueryPerformanceCounter
+// and galaxy/host_event.h replaces the Win32 auto-reset events. The event
+// calls keep their Win32 names through the small shims below so the shared
+// broker code is unchanged.
+#include "galaxy/host_event.h"
+#include <cerrno>
+#include <time.h>
+#include <pthread.h>
+#if defined(__APPLE__)
+#include <mach/mach_time.h>
+#include <pthread/qos.h>
+#endif
+namespace {
+using HANDLE = void*;
+using DWORD = unsigned long;
+constexpr int FALSE = 0;
+inline HANDLE CreateEventW(void*, int, int, void*) noexcept {
+    return galaxy::host::event_create();
+}
+inline int SetEvent(HANDLE event) noexcept {
+    galaxy::host::event_signal(event);
+    return 1;
+}
+inline int CloseHandle(HANDLE event) noexcept {
+    galaxy::host::event_close(event);
+    return 1;
+}
+inline DWORD GetLastError() noexcept { return static_cast<DWORD>(errno); }
+}  // namespace
+#endif
 #include "galaxy/windows_power.h"
 #include "galaxy/frame_timeline.h"
 
@@ -15,7 +48,9 @@
 #include <limits>
 #include <stdexcept>
 #include <system_error>
+#if defined(_MSC_VER)
 #include <intrin.h>
+#endif
 #include <algorithm>
 #include <utility>
 
@@ -24,6 +59,7 @@ namespace {
 
 constexpr std::uint64_t kMaximumSupportedCounterFrequency = 1'000'000'000ull;
 
+#if defined(_WIN32)
 std::uint64_t read_query_performance_counter(void*) noexcept {
     LARGE_INTEGER value{};
     if (QueryPerformanceCounter(&value) == FALSE || value.QuadPart < 0) {
@@ -47,6 +83,26 @@ bool processor_reports_invariant_tsc() noexcept {
     __cpuid(registers, 0x80000007);
     return (static_cast<unsigned>(registers[3]) & (1u << 8u)) != 0u;
 }
+#else
+#if defined(__APPLE__)
+// mach_absolute_time: the cheapest monotonic counter on Apple platforms
+// (24 MHz on Apple Silicon); its frequency comes from the timebase.
+std::uint64_t read_monotonic_counter(void*) noexcept { return mach_absolute_time(); }
+std::uint64_t monotonic_counter_frequency() noexcept {
+    mach_timebase_info_data_t timebase{};
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.numer == 0u) return 0u;
+    return 1'000'000'000ull * timebase.denom / timebase.numer;
+}
+#else
+std::uint64_t read_monotonic_counter(void*) noexcept {
+    timespec now{};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0u;
+    return static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ull +
+           static_cast<std::uint64_t>(now.tv_nsec);
+}
+std::uint64_t monotonic_counter_frequency() noexcept { return 1'000'000'000ull; }
+#endif
+#endif
 
 std::uint64_t saturating_add(
     std::uint64_t lhs,
@@ -139,6 +195,7 @@ std::chrono::nanoseconds timeline_wait_duration(
         std::chrono::nanoseconds(fractional_nanoseconds);
 }
 
+#if defined(_WIN32)
 void configure_deadline_worker_scheduling() {
     // The simulation thread runs at ABOVE_NORMAL and, when available, in the Games MMCSS class.
     // A default-priority broker can otherwise be starved by the thread whose hardware deadlines
@@ -341,9 +398,56 @@ public:
 private:
     HANDLE timer_{};
 };
+#else
+// POSIX: raise the broker toward the simulation thread's priority where the
+// platform lets an unprivileged process do so; failure is not fatal here.
+void configure_deadline_worker_scheduling() {
+#if defined(__APPLE__)
+    (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
+
+class ScopedMmcssDeadlineWorker {};
+
+// Deadlines and schedule changes both arrive through the auto-reset event;
+// the timed wait covers the next deadline.
+class ScopedDeadlineWaitTimer {
+public:
+    void wait_for(HANDLE wake_event, std::chrono::nanoseconds duration) const {
+        if (wake_event == nullptr) {
+            throw std::runtime_error("deadline broker wake event is unavailable");
+        }
+        if (duration.count() <= 0) {
+            return;
+        }
+        (void)galaxy::host::event_wait(wake_event, duration);
+    }
+
+    void wait_for_signal(HANDLE wake_event) const {
+        if (wake_event == nullptr) {
+            throw std::runtime_error("deadline broker wake event is unavailable");
+        }
+        (void)galaxy::host::event_wait(wake_event);
+    }
+};
+#endif
 
 }  // namespace
 
+#if !defined(_WIN32)
+CounterSource query_performance_counter_source() {
+    const std::uint64_t frequency = monotonic_counter_frequency();
+    if (frequency == 0u || frequency > kMaximumSupportedCounterFrequency) {
+        throw std::runtime_error("monotonic counter frequency is outside the supported range");
+    }
+    return CounterSource{&read_monotonic_counter, nullptr, frequency};
+}
+
+// The cheap counter is already the default source on POSIX hosts.
+std::optional<CounterSource> invariant_tsc_counter_source(unsigned) {
+    return std::nullopt;
+}
+#else
 CounterSource query_performance_counter_source() {
     LARGE_INTEGER frequency{};
     if (QueryPerformanceFrequency(&frequency) == FALSE ||
@@ -410,6 +514,7 @@ std::optional<CounterSource> invariant_tsc_counter_source(unsigned calibration_m
     source.frequency = source_hz;
     return source;
 }
+#endif
 
 std::uint64_t scale_counter_delta(
     std::uint64_t counter_delta,

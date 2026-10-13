@@ -1,3 +1,4 @@
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
@@ -107,3 +108,22 @@ Publisher::Publisher(std::function<Counts()> sample, std::uint64_t width,
 }
 Publisher::~Publisher() = default;
 }  // namespace galaxy::telemetry
+
+#else
+
+// Non-Windows hosts: the overlay IPC this publishes to (NVIDIA, Steam, Xbox
+// Game Bar frame counters) is Windows-only, so the publisher does nothing.
+#include "galaxy/frame_telemetry.h"
+
+namespace galaxy::telemetry {
+
+struct Publisher::Impl {};
+
+Publisher::Publisher(std::function<Counts()>, std::uint64_t, std::uint64_t,
+                     std::uint64_t) noexcept {}
+
+Publisher::~Publisher() = default;
+
+}  // namespace galaxy::telemetry
+
+#endif

@@ -838,7 +838,7 @@ static unsigned indexed_ternary_test_descriptor(unsigned form, unsigned target, 
     return target|(a<<5u)|(c<<10u)|(b<<15u)|(op<<20u)|
         (unsigned(form==5u)<<22u)|(unsigned(form!=4u)<<23u)|(unsigned(record)<<24u);
 }
-__declspec(noinline) static void indexed_ternary_test_original(galaxy::PpcContext* c,
+GALAXY_NOINLINE static void indexed_ternary_test_original(galaxy::PpcContext* c,
     unsigned d, const galaxy::NativeServicesV1* s, unsigned pc) {
     const unsigned t=d&31u,a=(d>>5u)&31u,m=(d>>10u)&31u,b=(d>>15u)&31u;
     const auto op=static_cast<galaxy::PpcFloatTernaryOperation>((d>>20u)&3u);

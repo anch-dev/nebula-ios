@@ -1,8 +1,12 @@
 #include "galaxy/runtime_instance.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <iostream>
 #include <string>
@@ -22,7 +26,11 @@ int main() {
     bool passed = true;
     const std::wstring identity =
         L"Nebula.RuntimeInstanceTests." +
+#if defined(_WIN32)
         std::to_wstring(GetCurrentProcessId());
+#else
+        std::to_wstring(getpid());
+#endif
 
     galaxy::RuntimeInstanceLease first;
     bool already_running = false;
