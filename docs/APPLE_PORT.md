@@ -35,7 +35,8 @@ On a non-Windows host the top-level `CMakeLists.txt` includes
    decodes LDR/STR/LDP/STP/LDUR/pre-/post-index/register-offset, SIMD&FP
    scalar forms and LD1/ST1 lanes. Handles SVE signal frames on Linux.
 
-Tests (all pass on x86-64 and on AArch64 under QEMU, with clang and GCC):
+Tests pass on x86-64, on AArch64 under QEMU (clang and GCC), and natively in CI
+on Linux ARM64 and macOS Apple Silicon; the iOS compile job is green too:
 `host_fiber_tests`, `coop_scheduler_tests`, `flat_guest_memory_posix_tests`.
 
 ## Next steps
