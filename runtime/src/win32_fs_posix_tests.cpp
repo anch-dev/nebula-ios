@@ -5,6 +5,7 @@
 // delete-on-close, file identity and volume queries.
 
 #include "galaxy/win32_fs.h"
+#include "galaxy/win32_host_posix.h"
 
 #include <chrono>
 #include <cstdio>
@@ -431,6 +432,77 @@ void test_environment() {
 
 }  // namespace
 
+// Process times and module queries, as the runtime's diagnostics use them.
+void test_process_and_modules() {
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    check(GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user) != FALSE,
+          "GetProcessTimes on the current process");
+    const auto ticks = [](const FILETIME& t) {
+        return (static_cast<std::uint64_t>(t.dwHighDateTime) << 32u) | t.dwLowDateTime;
+    };
+    const std::uint64_t before = ticks(user) + ticks(kernel);
+    volatile std::uint64_t spin = 0;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(60);
+    while (std::chrono::steady_clock::now() < until) spin = spin + 1u;
+    check(GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user) != FALSE &&
+              ticks(user) + ticks(kernel) > before,
+          "process CPU time advances");
+    check(GetProcessTimes(reinterpret_cast<HANDLE>(static_cast<std::intptr_t>(1234)), &creation,
+                          &exit, &kernel, &user) == FALSE,
+          "GetProcessTimes rejects other processes");
+
+    wchar_t exe[4096]{};
+    const DWORD exe_length = GetModuleFileNameW(nullptr, exe, 4096u);
+    check(exe_length > 0u && exe_length < 4096u && fs::exists(fs::path(exe)),
+          "GetModuleFileNameW(nullptr) names the executable");
+    wchar_t tiny[4]{};
+    check(GetModuleFileNameW(nullptr, tiny, 4u) == 4u && tiny[3] == L'\0' &&
+              GetLastError() == ERROR_INSUFFICIENT_BUFFER,
+          "GetModuleFileNameW truncates and terminates");
+    check(GetModuleHandleW(nullptr) != nullptr, "GetModuleHandleW(nullptr)");
+
+    HMODULE self = nullptr;
+    check(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCWSTR>(&test_process_and_modules), &self) &&
+              self != nullptr &&
+              reinterpret_cast<std::uintptr_t>(self) <=
+                  reinterpret_cast<std::uintptr_t>(&test_process_and_modules),
+          "GetModuleHandleExW(FROM_ADDRESS) returns the image base");
+    wchar_t self_path[4096]{};
+    check(GetModuleFileNameW(self, self_path, 4096u) > 0u &&
+              fs::equivalent(fs::path(self_path), fs::path(exe)),
+          "an image base resolves to its file");
+    HMODULE counted = nullptr;
+    check(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                             reinterpret_cast<LPCWSTR>(&test_process_and_modules), &counted) ==
+                  FALSE &&
+              counted == nullptr,
+          "reference-taking module lookups are refused");
+
+    const std::string missing = (g_root / "missing.dylib").string();
+    check(LoadLibraryExW(missing.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR) == nullptr &&
+              GetLastError() == ERROR_FILE_NOT_FOUND,
+          "LoadLibraryExW of a missing file");
+#if defined(__APPLE__)
+    const wchar_t* const system_library = L"/usr/lib/libSystem.B.dylib";
+#else
+    const wchar_t* const system_library = L"libc.so.6";
+#endif
+    HMODULE library = LoadLibraryExW(system_library, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    check(library != nullptr, "LoadLibraryExW of a system library");
+    if (library != nullptr) {
+        check(GetProcAddress(library, "strlen") != nullptr, "GetProcAddress");
+        check(GetProcAddress(library, "galaxy_no_such_export") == nullptr &&
+                  GetLastError() == ERROR_PROC_NOT_FOUND,
+              "GetProcAddress of a missing export");
+        wchar_t library_path[4096]{};
+        check(GetModuleFileNameW(library, library_path, 4096u) > 0u,
+              "GetModuleFileNameW of a loaded library");
+        check(FreeLibrary(library) != FALSE, "FreeLibrary");
+    }
+}
+
 int main() {
     const char* const base = std::getenv("TMPDIR");
     g_root = fs::path(base != nullptr && *base != '\0' ? base : "/tmp") /
@@ -444,6 +516,7 @@ int main() {
     test_delete_on_close_and_identity();
     test_events_and_mappings();
     test_environment();
+    test_process_and_modules();
     fs::remove_all(g_root);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d win32 fs check(s) failed\n", g_failures);

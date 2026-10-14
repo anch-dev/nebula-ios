@@ -15,10 +15,17 @@
 #include <mutex>
 #include <string>
 
+#include <cstdio>
+#include <unordered_map>
+
 #include <dlfcn.h>
+#include <limits.h>
 #include <pthread.h>
+#include <sys/resource.h>
 #include <time.h>
+#include <unistd.h>
 #if defined(__APPLE__)
+#include <mach-o/dyld.h>
 #include <pthread/qos.h>
 #endif
 
@@ -159,6 +166,33 @@ BOOL GetThreadTimes(HANDLE thread, FILETIME* creation, FILETIME* exit, FILETIME*
     return TRUE;
 }
 
+BOOL GetProcessTimes(HANDLE process, FILETIME* creation, FILETIME* exit, FILETIME* kernel,
+                     FILETIME* user) noexcept {
+    if (process != GetCurrentProcess()) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return FALSE;
+    }
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        SetLastError(win32_error_from_errno(errno));
+        return FALSE;
+    }
+    const auto ns = [](const timeval& value) {
+        return static_cast<std::uint64_t>(value.tv_sec) * 1'000'000'000ull +
+               static_cast<std::uint64_t>(value.tv_usec) * 1'000ull;
+    };
+    if (creation != nullptr) *creation = {};
+    if (exit != nullptr) *exit = {};
+    if (kernel != nullptr) *kernel = filetime_from_ns(ns(usage.ru_stime));
+    if (user != nullptr) *user = filetime_from_ns(ns(usage.ru_utime));
+    return TRUE;
+}
+
+void ExitProcess(UINT exit_code) noexcept {
+    std::fflush(nullptr);
+    _exit(static_cast<int>(exit_code));
+}
+
 // ---------------------------------------------------------------------------
 // Modules
 // ---------------------------------------------------------------------------
@@ -185,7 +219,127 @@ std::string platform_library_name(std::string name) {
 #endif
 }
 
+// dlopen handles are opaque (they are not image bases), so the file each was
+// opened from is recorded for GetModuleFileNameW.
+std::mutex& module_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+std::unordered_map<void*, std::string>& module_paths() {
+    static auto* paths = new std::unordered_map<void*, std::string>;
+    return *paths;
+}
+void remember_module_path(void* module, const std::string& file) {
+    char resolved[PATH_MAX];
+    const std::string path = realpath(file.c_str(), resolved) != nullptr ? resolved : file;
+    const std::lock_guard<std::mutex> lock(module_mutex());
+    module_paths()[module] = path;
+}
+
+std::string executable_path() {
+#if defined(__APPLE__)
+    std::uint32_t size = 0;
+    (void)_NSGetExecutablePath(nullptr, &size);
+    std::string path(size, '\0');
+    if (_NSGetExecutablePath(path.data(), &size) != 0) return {};
+    path.resize(std::strlen(path.c_str()));
+    char resolved[PATH_MAX];
+    return realpath(path.c_str(), resolved) != nullptr ? std::string(resolved) : path;
+#else
+    char buffer[PATH_MAX];
+    const ssize_t length = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1u);
+    return length > 0 ? std::string(buffer, static_cast<std::size_t>(length)) : std::string{};
+#endif
+}
+
 }  // namespace
+
+HMODULE LoadLibraryExW(const wchar_t* name, HANDLE, DWORD) noexcept {
+    return LoadLibraryW(name);
+}
+
+HMODULE GetModuleHandleW(const wchar_t* name) noexcept {
+    try {
+        void* module = name == nullptr
+            ? dlopen(nullptr, RTLD_NOW)
+            : dlopen(platform_library_name(galaxy::win32::narrow(name)).c_str(),
+                     RTLD_NOW | RTLD_NOLOAD);
+        // GetModuleHandle does not take a reference; dlopen did.
+        if (module != nullptr && name != nullptr) (void)dlclose(module);
+        SetLastError(module != nullptr ? ERROR_SUCCESS : ERROR_MOD_NOT_FOUND);
+        return module;
+    } catch (...) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+}
+
+BOOL GetModuleHandleExW(DWORD flags, const wchar_t* name_or_address, HMODULE* module) noexcept {
+    if (module == nullptr) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    *module = nullptr;
+    if ((flags & GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT) == 0u) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return FALSE;
+    }
+    if ((flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) == 0u) {
+        *module = GetModuleHandleW(name_or_address);
+        return *module != nullptr ? TRUE : FALSE;
+    }
+    Dl_info info{};
+    if (dladdr(name_or_address, &info) == 0 || info.dli_fbase == nullptr) {
+        SetLastError(ERROR_MOD_NOT_FOUND);
+        return FALSE;
+    }
+    *module = info.dli_fbase;
+    return TRUE;
+}
+
+DWORD GetModuleFileNameW(HMODULE module, wchar_t* path, DWORD size) noexcept {
+    if (path == nullptr || size == 0u) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0u;
+    }
+    try {
+        std::string file;
+        if (module == nullptr) {
+            file = executable_path();
+        } else {
+            {
+                const std::lock_guard<std::mutex> lock(module_mutex());
+                const auto found = module_paths().find(module);
+                if (found != module_paths().end()) file = found->second;
+            }
+            Dl_info info{};
+            if (file.empty() && dladdr(module, &info) != 0 && info.dli_fbase == module &&
+                info.dli_fname != nullptr) {
+                file = info.dli_fname;
+            }
+        }
+        if (file.empty()) {
+            path[0] = L'\0';
+            SetLastError(ERROR_MOD_NOT_FOUND);
+            return 0u;
+        }
+        const std::wstring wide = galaxy::win32::widen(file.c_str());
+        if (wide.size() >= size) {
+            // Truncated and terminated, as Windows does.
+            std::wmemcpy(path, wide.data(), size - 1u);
+            path[size - 1u] = L'\0';
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return size;
+        }
+        std::wmemcpy(path, wide.data(), wide.size());
+        path[wide.size()] = L'\0';
+        SetLastError(ERROR_SUCCESS);
+        return static_cast<DWORD>(wide.size());
+    } catch (...) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0u;
+    }
+}
 
 HMODULE LoadLibraryA(const char* name) noexcept {
     if (name == nullptr) {
@@ -193,8 +347,15 @@ HMODULE LoadLibraryA(const char* name) noexcept {
         return nullptr;
     }
     try {
-        void* const module = dlopen(platform_library_name(name).c_str(), RTLD_NOW | RTLD_LOCAL);
-        SetLastError(module != nullptr ? ERROR_SUCCESS : ERROR_FILE_NOT_FOUND);
+        const std::string file = platform_library_name(name);
+        void* const module = dlopen(file.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (module == nullptr) {
+            if (const char* reason = dlerror()) std::fprintf(stderr, "[module] dlopen: %s\n", reason);
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return nullptr;
+        }
+        remember_module_path(module, file);
+        SetLastError(ERROR_SUCCESS);
         return module;
     } catch (...) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
@@ -226,7 +387,10 @@ BOOL FreeLibrary(HMODULE module) noexcept {
         SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
     }
-    return dlclose(module) == 0 ? TRUE : FALSE;
+    if (dlclose(module) != 0) return FALSE;
+    // dlopen reference counts; the recorded path is kept while any reference
+    // may remain (re-recorded identically on the next load).
+    return TRUE;
 }
 
 // ---------------------------------------------------------------------------

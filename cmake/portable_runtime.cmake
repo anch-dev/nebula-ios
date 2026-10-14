@@ -203,3 +203,41 @@ target_compile_definitions(galaxy_header_check_fast_float_flat PRIVATE
 target_compile_definitions(galaxy_header_check_single_float PRIVATE
     GALAXY_FAST_FLOAT=1 GALAXY_FASTMEM=1 GALAXY_SINGLE_FLOAT_ARITHMETIC=1
     GALAXY_ASSUME_PAIRED_SINGLES=1)
+
+# The native runtime (native_runtime.cpp). Its renderer, galaxy_gx, is still
+# Direct3D 12 only (step 7 of docs/APPLE_PORT.md), so for now the runtime is
+# compiled to check the port but not linked into an executable.
+set(NEBULA_SOURCE_REVISION "" CACHE STRING "Revision of exported source")
+set(NEBULA_SOURCE_REVISION_KIND "unknown" CACHE STRING "Exported revision object type (commit or tree)")
+set(NEBULA_SOURCE_GIT_TREE "unknown" CACHE STRING "Git tree of exported source")
+set(NEBULA_SOURCE_TREE_SHA256 "" CACHE STRING "Exported source manifest tree SHA256")
+set(NEBULA_SOURCE_DIRTY "unknown" CACHE STRING "Exported source dirty state")
+mark_as_advanced(NEBULA_SOURCE_REVISION NEBULA_SOURCE_REVISION_KIND NEBULA_SOURCE_GIT_TREE
+    NEBULA_SOURCE_TREE_SHA256 NEBULA_SOURCE_DIRTY)
+set(galaxy_native_isa_effective "${CMAKE_SYSTEM_PROCESSOR}")
+set(GALAXY_NATIVE_ISA "${CMAKE_SYSTEM_PROCESSOR}")
+set(NEBULA_DSP_MODULE "retired-mixer")
+set(nebula_host_ipo_effective OFF)
+set(NEBULA_ID_TARGET_OPTIONS "")
+get_directory_property(NEBULA_ID_DIRECTORY_OPTIONS COMPILE_OPTIONS)
+configure_file(cmake/runtime_identity_config.cmake.in runtime_identity_config.cmake @ONLY)
+add_custom_target(nebula_runtime_identity
+    COMMAND "${CMAKE_COMMAND}"
+        "-DCONFIG_FILE=${CMAKE_CURRENT_BINARY_DIR}/runtime_identity_config.cmake"
+        "-DBUILD_CONFIG=$<CONFIG>"
+        "-DOUTPUT_HEADER=${CMAKE_CURRENT_BINARY_DIR}/nebula_build_identity.h"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/runtime_build_identity.cmake"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/nebula_build_identity.h"
+    VERBATIM)
+
+add_library(galaxy_native_runtime_objects OBJECT
+    runtime/src/native_runtime.cpp
+    runtime/src/native_thp_video.cpp
+    runtime/src/site_hooks.cpp
+    runtime/src/runtime_main_posix.cpp)
+add_dependencies(galaxy_native_runtime_objects nebula_runtime_identity)
+target_include_directories(galaxy_native_runtime_objects PRIVATE
+    "${galaxy_runtime_include}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src"
+    "${CMAKE_CURRENT_BINARY_DIR}")

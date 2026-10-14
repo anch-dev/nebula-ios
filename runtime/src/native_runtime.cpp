@@ -42,6 +42,7 @@
 #include "galaxy/simulation_cache_affinity.h"
 #include "galaxy/vi_boundary.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
@@ -50,6 +51,24 @@
 #include <TlHelp32.h>
 #include <Shellapi.h>
 #include <timeapi.h>
+#else
+// Linux/macOS/iOS: Win32 vocabulary through the POSIX shims.
+#include "galaxy/host_fiber.h"
+#include "galaxy/platform_compat.h"
+#include "galaxy/portable_hash.h"
+#include "galaxy/win32_fs.h"
+#include "galaxy/win32_host_posix.h"
+#include <csignal>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <string.h>
+#if defined(__APPLE__)
+#include <sys/ucontext.h>
+#else
+#include <ucontext.h>
+#endif
+#endif
 
 #include "galaxy/windows_power.h"
 #include "galaxy/frame_timeline.h"
@@ -62,7 +81,9 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#if defined(_WIN32)
 #include <crtdbg.h>
+#endif
 #include <cstdlib>
 #include <chrono>
 #include <cstdint>
@@ -75,8 +96,10 @@
 #include <functional>
 #include <iomanip>
 #include <initializer_list>
+#if defined(_WIN32)
 #include <intrin.h>
 #include <Psapi.h>
+#endif
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -92,10 +115,12 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "Shell32.lib")
+#endif
 
 namespace {
 
@@ -103,6 +128,12 @@ namespace {
 // thread. The game module holds ~200 MB of code; running a part of it for
 // the first time otherwise page-faults it in from disk on the simulation
 // thread, mid-frame. GALAXY_PREFETCH_MODULES=0 turns this off.
+#if !defined(_WIN32)
+// dyld/ld.so map the game module lazily too, but its size is not known from
+// the handle alone; first-touch faults are cheap on flash storage, so POSIX
+// hosts do not prefetch.
+void prefetch_module_image_async(HMODULE) noexcept {}
+#else
 void prefetch_module_image_async(HMODULE module) noexcept {
     static const bool enabled = [] {
         char value[8]{};
@@ -127,6 +158,7 @@ void prefetch_module_image_async(HMODULE module) noexcept {
     } catch (...) {
     }
 }
+#endif
 
 class RuntimeFailure final : public std::runtime_error {
 public:
@@ -451,6 +483,9 @@ std::string sha256_ascii_upper_hex(std::span<const char> text) {
     if (text.size() > std::numeric_limits<ULONG>::max()) {
         throw RuntimeFailure("native performance semantic state is too large");
     }
+#if !defined(_WIN32)
+    return galaxy::hash::sha256_hex(std::as_bytes(text), true);
+#else
 
     BCRYPT_ALG_HANDLE algorithm = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
@@ -514,6 +549,7 @@ std::string sha256_ascii_upper_hex(std::span<const char> text) {
         output << std::setw(2) << static_cast<unsigned int>(byte);
     }
     return output.str();
+#endif
 }
 
 void append_performance_semantic_literal(
@@ -762,6 +798,20 @@ bool native_thp_async_decode_enabled() {
 //   - blocked samples by the innermost runtime frame (the wait site).
 // Printed at shutdown as [sim-profile*] lines; runtime and system addresses resolve through dbghelp
 // when NebulaRuntime.pdb sits beside the executable.
+#if !defined(_WIN32)
+// POSIX hosts have no suspend-and-read-context sampling here; Instruments
+// (Apple) or perf (Linux) profile the runtime from outside instead.
+class SimulationProfiler {
+public:
+    void start(const galaxy::FunctionRecordV1*, std::size_t, HMODULE) {
+        std::cerr << "[sim-profile] unavailable on this platform; use Instruments or perf\n";
+    }
+    void start_named(const wchar_t*, std::string tag) {
+        std::cerr << '[' << tag << "] unavailable on this platform\n";
+    }
+    void stop_and_print(std::ostream&) {}
+};
+#else
 class SimulationProfiler {
 public:
     ~SimulationProfiler() {
@@ -1283,6 +1333,7 @@ private:
     bool symbols_attempted_ = false;
     bool symbols_ready_ = false;
 };
+#endif
 
 SimulationProfiler g_sim_profiler;
 // The loaded module's function records (guest address, native entry), for
@@ -21766,7 +21817,7 @@ std::uint32_t guest_r1_owner_thread(
     return guest_r1_owner_thread_impl<false>(memory, services, r1);
 }
 
-__declspec(noinline) std::uint32_t resolve_guest_stack_owner_thread_slow(
+GALAXY_NOINLINE std::uint32_t resolve_guest_stack_owner_thread_slow(
     RuntimeState& state,
     galaxy::GuestMemoryV1* memory,
     std::uint32_t r1,
@@ -31541,6 +31592,140 @@ static_assert(!parse_unsigned_decimal(L"-1") && !parse_unsigned_decimal(L"+1"));
 static_assert(!parse_unsigned_decimal(L" 1") && !parse_unsigned_decimal(L"1ms"));
 static_assert(!parse_unsigned_decimal(L""));
 
+#if !defined(_WIN32)
+// POSIX hosts: no minidumps. A fatal signal prints the same [crash] report
+// (faulting module and offset, argument registers, fastmem statistics) and a
+// symbolized backtrace to stderr, then takes the default action so the OS
+// crash reporter (ReportCrash on Apple, core dumps on Linux) still sees it.
+// install_fault_handler() chains unhandled fastmem faults to this handler.
+namespace {
+
+std::atomic<bool> g_crash_reporting{false};
+
+std::uintptr_t crash_context_pc(const void* context, std::uintptr_t (&args)[4]) noexcept {
+    const auto* uc = static_cast<const ucontext_t*>(context);
+    args[0] = args[1] = args[2] = args[3] = 0u;
+    if (uc == nullptr) return 0u;
+#if defined(__APPLE__) && defined(__aarch64__)
+    for (int i = 0; i < 4; ++i) args[i] = static_cast<std::uintptr_t>(uc->uc_mcontext->__ss.__x[i]);
+    return static_cast<std::uintptr_t>(uc->uc_mcontext->__ss.__pc);
+#elif defined(__APPLE__) && defined(__x86_64__)
+    args[0] = uc->uc_mcontext->__ss.__rdi;
+    args[1] = uc->uc_mcontext->__ss.__rsi;
+    args[2] = uc->uc_mcontext->__ss.__rdx;
+    args[3] = uc->uc_mcontext->__ss.__rcx;
+    return static_cast<std::uintptr_t>(uc->uc_mcontext->__ss.__rip);
+#elif defined(__linux__) && defined(__aarch64__)
+    for (int i = 0; i < 4; ++i) args[i] = static_cast<std::uintptr_t>(uc->uc_mcontext.regs[i]);
+    return static_cast<std::uintptr_t>(uc->uc_mcontext.pc);
+#elif defined(__linux__) && defined(__x86_64__)
+    args[0] = static_cast<std::uintptr_t>(uc->uc_mcontext.gregs[REG_RDI]);
+    args[1] = static_cast<std::uintptr_t>(uc->uc_mcontext.gregs[REG_RSI]);
+    args[2] = static_cast<std::uintptr_t>(uc->uc_mcontext.gregs[REG_RDX]);
+    args[3] = static_cast<std::uintptr_t>(uc->uc_mcontext.gregs[REG_RCX]);
+    return static_cast<std::uintptr_t>(uc->uc_mcontext.gregs[REG_RIP]);
+#else
+    return 0u;
+#endif
+}
+
+void galaxy_fatal_signal_handler(int signal_number, siginfo_t* info, void* context) {
+    // Back to the default action first: a fault inside this report, or the
+    // re-executed access after it returns, ends the process normally.
+    std::signal(signal_number, SIG_DFL);
+    if (g_crash_reporting.exchange(true)) return;
+    // A crash never leaves a controller vibrating (bounded writes).
+    galaxy::host::stop_all_rumble();
+    std::uintptr_t args[4]{};
+    const std::uintptr_t pc = crash_context_pc(context, args);
+    Dl_info module{};
+    const bool have_module = pc != 0u && dladdr(reinterpret_cast<void*>(pc), &module) != 0;
+    std::fprintf(stderr,
+        "[crash] signal %d (%s) code=%d at pc=0x%llx fault-address=%p thread=%lu\n",
+        signal_number, strsignal(signal_number), info != nullptr ? info->si_code : 0,
+        static_cast<unsigned long long>(pc), info != nullptr ? info->si_addr : nullptr,
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    std::fprintf(stderr,
+        "[crash] module=%s offset=0x%llx arg0=0x%llx arg1=0x%llx arg2=0x%llx arg3=0x%llx\n",
+        have_module && module.dli_fname != nullptr ? module.dli_fname : "?",
+        static_cast<unsigned long long>(
+            have_module ? pc - reinterpret_cast<std::uintptr_t>(module.dli_fbase) : 0u),
+        static_cast<unsigned long long>(args[0]), static_cast<unsigned long long>(args[1]),
+        static_cast<unsigned long long>(args[2]), static_cast<unsigned long long>(args[3]));
+    const auto faults = galaxy::host::flat_guest_memory::fault_stats();
+    for (std::size_t i = 0; i < 8u && faults.hot_counts[i] != 0u; ++i) {
+        std::fprintf(stderr, "[crash] fastmem-hot-page guest=0x%08X faults=%llu\n",
+            static_cast<unsigned>(faults.hot_pages[i] << 12u),
+            static_cast<unsigned long long>(faults.hot_counts[i]));
+    }
+    for (std::size_t i = 0; i < 16u && faults.hot_address_counts[i] != 0u; ++i) {
+        std::fprintf(stderr, "[crash] fastmem-hot-address guest=0x%08X faults=%llu\n",
+            static_cast<unsigned>(faults.hot_addresses[i]),
+            static_cast<unsigned long long>(faults.hot_address_counts[i]));
+    }
+    std::fprintf(stderr,
+        "[crash] fastmem handled-reads=%llu handled-writes=%llu unhandled=%llu last=\"%s\"\n",
+        static_cast<unsigned long long>(faults.handled_reads),
+        static_cast<unsigned long long>(faults.handled_writes),
+        static_cast<unsigned long long>(faults.unhandled),
+        galaxy::host::flat_guest_memory::last_unhandled_fault_message());
+    std::fflush(stderr);
+    void* frames[64];
+    const int frame_count = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, frame_count, 2);
+    // Synchronous faults return and re-execute into the default action;
+    // an abort() (or a raised signal) is raised again.
+    if (signal_number == SIGABRT || info == nullptr || info->si_code <= 0) {
+        std::raise(signal_number);
+    }
+}
+
+[[noreturn]] void galaxy_terminate_handler() {
+    std::fprintf(stderr, "[crash] std::terminate() called");
+    if (const std::exception_ptr eptr = std::current_exception()) {
+        try {
+            std::rethrow_exception(eptr);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, " -- active exception: %s", e.what());
+        } catch (...) {
+            std::fprintf(stderr, " -- active exception of unknown type");
+        }
+    } else {
+        std::fprintf(stderr, " -- no active exception (noexcept violation, "
+                              "double exception, or a raw abort() call)");
+    }
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+    std::abort();  // reported by the SIGABRT handler
+}
+
+}  // namespace
+
+static void disable_runtime_dialogs() {
+    // An alternate stack, so a stack overflow on the main thread still reports.
+    static std::array<std::byte, 64u * 1024u> alternate_stack{};
+    stack_t stack{};
+    stack.ss_sp = alternate_stack.data();
+    stack.ss_size = alternate_stack.size();
+    (void)sigaltstack(&stack, nullptr);
+    struct sigaction action {};
+    action.sa_sigaction = &galaxy_fatal_signal_handler;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&action.sa_mask);
+    for (const int signal_number : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP}) {
+        (void)sigaction(signal_number, &action, nullptr);
+    }
+    // The first backtrace() loads the unwinder (dlopen), which must not
+    // happen inside a signal handler: another thread may hold the loader lock.
+    {
+        void* frame[1];
+        (void)backtrace(frame, 1);
+    }
+    // A closed log pipe must not kill the runtime mid-save.
+    std::signal(SIGPIPE, SIG_IGN);
+    std::set_terminate(galaxy_terminate_handler);
+}
+#else
 static wchar_t g_crash_dump_dir[MAX_PATH]{};
 static bool g_crash_dump_full = false;
 
@@ -31737,7 +31922,48 @@ static void disable_runtime_dialogs() {
     }
     SetErrorMode(error_mode);
 }
+#endif
 
+#if !defined(_WIN32)
+// POSIX hosts have no process priority classes, MMCSS or timer resolution.
+// The simulation thread asks for the highest thread level, which the shim
+// maps onto the user-interactive QoS class on Apple hosts.
+static void configure_runtime_scheduling() {
+    if (read_env_flag("GALAXY_POWER_THROTTLING_OPTOUT", true)) {
+        galaxy::host::opt_out_of_power_throttling_process();
+        galaxy::host::opt_out_of_power_throttling_thread();
+    }
+    if (read_env_flag("GALAXY_RUNTIME_HIGH_PRIORITY", true)) {
+        (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+    std::fprintf(stderr, "[thread-priority] this-thread-level=%d note=qos-class-on-apple\n",
+                 GetThreadPriority(GetCurrentThread()));
+}
+
+class ScopedSimulationCacheAffinity {
+public:
+    void apply() {
+        if (read_env_flag("GALAXY_SIMULATION_LARGEST_CACHE", false)) {
+            std::cerr << "[runtime] Simulation cache affinity unchanged: "
+                         "not supported on this platform error=0\n";
+        }
+    }
+};
+
+struct ScopedMmcssGamesThread {
+    ScopedMmcssGamesThread() {}  // user-provided: a scope guard, not an unused value
+    ScopedMmcssGamesThread(const ScopedMmcssGamesThread&) = delete;
+    ScopedMmcssGamesThread& operator=(const ScopedMmcssGamesThread&) = delete;
+};
+
+struct ScopedTimerResolution {
+    ScopedTimerResolution() {}  // user-provided: a scope guard, not an unused value
+    ScopedTimerResolution(const ScopedTimerResolution&) = delete;
+    ScopedTimerResolution& operator=(const ScopedTimerResolution&) = delete;
+};
+
+static void configure_windows_game_identity() {}
+#else
 static char const* priority_class_name(DWORD value) {
     switch (value) {
     case IDLE_PRIORITY_CLASS:         return "IDLE";
@@ -32064,6 +32290,20 @@ static void configure_windows_game_identity() {
     }
     FreeLibrary(shell32);
 }
+#endif
+
+// A native module's file name: <stem>.dll on Windows, <stem>.dylib on Apple
+// hosts and <stem>.so on Linux.
+static std::filesystem::path native_module_file(std::string_view stem) {
+#if defined(_WIN32)
+    constexpr std::string_view extension = ".dll";
+#elif defined(__APPLE__)
+    constexpr std::string_view extension = ".dylib";
+#else
+    constexpr std::string_view extension = ".so";
+#endif
+    return std::filesystem::path(std::string(stem) + std::string(extension));
+}
 
 struct RuntimeLaunchPaths {
     std::filesystem::path game_pak_dir;
@@ -32119,16 +32359,16 @@ static RuntimeLaunchPaths default_runtime_launch_paths() {
     paths.module_path = get_env_path_w(L"GALAXY_MODULE_PATH");
     if (paths.module_path.empty()) {
         const std::filesystem::path sidecar_module =
-            exe_dir / "RMGE01_game.dll";
+            exe_dir / native_module_file("RMGE01_game");
         const std::array module_candidates{
             sidecar_module,
             repo_root / "generated" / "native-module-proof-build" /
-                "Release" / "RMGE01_game.dll",
+                "Release" / native_module_file("RMGE01_game"),
             repo_root / "generated" / "native-module-proof" /
-                "build-buildtools" / "Release" / "RMGE01_game.dll",
+                "build-buildtools" / "Release" / native_module_file("RMGE01_game"),
             repo_root / "generated" / "native-module-proof" /
-                "build-ninja" / "Release" / "RMGE01_game.dll",
-            repo_root / "Release" / "RMGE01_game.dll",
+                "build-ninja" / "Release" / native_module_file("RMGE01_game"),
+            repo_root / "Release" / native_module_file("RMGE01_game"),
         };
         paths.module_path = module_candidates.front();
         for (const auto& candidate : module_candidates) {
@@ -32143,6 +32383,10 @@ static RuntimeLaunchPaths default_runtime_launch_paths() {
 }
 
 static bool launch_settings_gui() {
+#if !defined(_WIN32)
+    // The app shell is the launcher on Apple hosts; nothing to open.
+    return false;
+#else
     // A bare double-click on the runtime opens the Nebula launcher beside it.
     const std::filesystem::path exe_dir =
         current_executable_path().parent_path();
@@ -32164,6 +32408,7 @@ static bool launch_settings_gui() {
         return false;
     }
     return true;
+#endif
 }
 
 static void print_runtime_usage() {
@@ -32179,7 +32424,13 @@ static void print_runtime_usage() {
            L"GALAXY_GAME_PATH/GALAXY_MODULE_PATH defaults directly.\n";
 }
 
+#if defined(_WIN32)
 int wmain(int argc, wchar_t** argv) {
+#else
+// POSIX hosts enter through galaxy_runtime_main (below), which an executable's
+// main or an app shell's game thread calls.
+static int runtime_wmain(int argc, wchar_t** argv) {
+#endif
     // First statement: before any allocation or assertion.
     disable_runtime_dialogs();
     // Every aspect setting, 4:3 included, runs through the live aspect path
@@ -32207,11 +32458,13 @@ int wmain(int argc, wchar_t** argv) {
     const auto session_start = std::chrono::steady_clock::now();
     // Process-local awareness must precede every HWND and input/render thread.
     // Output sizes, GetClientRect and mouse coordinates now use physical pixels.
+#if defined(_WIN32)
     if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) &&
         !AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(),DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
         std::cerr<<"[display] cannot establish physical-pixel DPI awareness error="<<GetLastError()<<'\n';
         return 9;
     }
+#endif
     galaxy::host::name_current_thread(L"Nebula Simulation/Main");
     galaxy::timeline::initialize_from_environment();
     const ScopedTimerResolution timer_resolution;
@@ -32980,7 +33233,11 @@ int wmain(int argc, wchar_t** argv) {
         state.module_float_flags = float_flags_fn();
         if ((state.module_float_flags & galaxy::kModuleFloatFlagFastFloat) != 0u &&
             read_env_flag("GALAXY_FAST_FLOAT_FTZ_DAZ", true)) {
+#if defined(_WIN32)
             _mm_setcsr(_mm_getcsr() | 0x8040u);
+#else
+            galaxy::host::fp_enable_flush_denormals();  // FTZ|DAZ, or FPCR.FZ
+#endif
             state.fast_float_mxcsr = true;
         }
     }
@@ -33196,7 +33453,7 @@ int wmain(int argc, wchar_t** argv) {
     // install-time compiler emits this separate native DLL next to the game
     // module; require and validate it before the guest can reach the loader.
     const std::filesystem::path home_button_rso_path =
-        abs_module_path.parent_path() / L"RMGE01_home_button.dll";
+        abs_module_path.parent_path() / native_module_file("RMGE01_home_button");
     if (!std::filesystem::is_regular_file(home_button_rso_path)) {
         std::wcerr << L"[boot] Required Home Button native sidecar is missing: "
                    << home_button_rso_path.c_str() << L'\n';
@@ -34076,3 +34333,24 @@ int wmain(int argc, wchar_t** argv) {
     finish_process(exit_code);
     return static_cast<int>(exit_code);
 }
+
+#if !defined(_WIN32)
+extern "C" int galaxy_runtime_main(int argc, char** argv) {
+    // Arguments arrive as UTF-8; the runtime parses them as wide strings, as
+    // it does on Windows.
+    std::vector<std::wstring> arguments;
+    std::vector<wchar_t*> wide_argv;
+    try {
+        arguments.reserve(static_cast<std::size_t>(argc > 0 ? argc : 0));
+        for (int i = 0; i < argc; ++i) {
+            arguments.push_back(galaxy::win32::widen(argv[i] != nullptr ? argv[i] : ""));
+        }
+        for (std::wstring& argument : arguments) wide_argv.push_back(argument.data());
+        wide_argv.push_back(nullptr);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[boot] invalid command line: %s\n", error.what());
+        return 2;
+    }
+    return runtime_wmain(argc, wide_argv.data());
+}
+#endif

@@ -41,6 +41,12 @@ int GetThreadPriority(HANDLE thread) noexcept;
 // CPU time of the calling thread (only GetCurrentThread() is supported).
 BOOL GetThreadTimes(HANDLE thread, FILETIME* creation, FILETIME* exit, FILETIME* kernel,
                     FILETIME* user) noexcept;
+// Process CPU time (getrusage); only GetCurrentProcess() is supported.
+BOOL GetProcessTimes(HANDLE process, FILETIME* creation, FILETIME* exit, FILETIME* kernel,
+                     FILETIME* user) noexcept;
+// Ends the process at once, as ExitProcess does for a process whose cleanup
+// already ran: stdio is flushed, static destructors and atexit hooks are not.
+[[noreturn]] void ExitProcess(UINT exit_code) noexcept;
 inline BOOL QueryThreadCycleTime(HANDLE, ULONG64* cycles) noexcept {
     if (cycles != nullptr) *cycles = 0;
     SetLastError(ERROR_NOT_SUPPORTED);
@@ -55,6 +61,26 @@ HMODULE LoadLibraryW(const wchar_t* name) noexcept;
 HMODULE LoadLibraryA(const char* name) noexcept;
 FARPROC GetProcAddress(HMODULE module, const char* name) noexcept;
 BOOL FreeLibrary(HMODULE module) noexcept;
+// Search-path flags are accepted and ignored: a full path is loaded as given.
+inline constexpr DWORD LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR = 0x00000100u;
+inline constexpr DWORD LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800u;
+HMODULE LoadLibraryExW(const wchar_t* name, HANDLE reserved, DWORD flags) noexcept;
+// std::filesystem::path::c_str() is narrow on POSIX.
+inline HMODULE LoadLibraryExW(const char* name, HANDLE, DWORD) noexcept {
+    return LoadLibraryA(name);
+}
+// A loaded module by name (nullptr: the main program), without loading it.
+HMODULE GetModuleHandleW(const wchar_t* name) noexcept;
+inline constexpr DWORD GET_MODULE_HANDLE_EX_FLAG_PIN = 0x1u;
+inline constexpr DWORD GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT = 0x2u;
+inline constexpr DWORD GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS = 0x4u;
+// With FROM_ADDRESS the result is the containing image's base address, as on
+// Windows (where an HMODULE is the base): good for offsets and
+// GetModuleFileNameW, not for GetProcAddress/FreeLibrary. Only
+// UNCHANGED_REFCOUNT lookups are supported.
+BOOL GetModuleHandleExW(DWORD flags, const wchar_t* name_or_address, HMODULE* module) noexcept;
+// The file of a module handle, an image base, or (nullptr) the executable.
+DWORD GetModuleFileNameW(HMODULE module, wchar_t* path, DWORD size) noexcept;
 
 // ---------------------------------------------------------------------------
 // The virtual window

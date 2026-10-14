@@ -143,6 +143,7 @@ inline constexpr DWORD ERROR_PROC_NOT_FOUND = 127;
 inline constexpr DWORD ERROR_BAD_ARGUMENTS = 160;
 inline constexpr DWORD ERROR_DISK_FULL = 112;
 inline constexpr DWORD ERROR_INSUFFICIENT_BUFFER = 122;
+inline constexpr DWORD ERROR_MOD_NOT_FOUND = 126;
 inline constexpr DWORD ERROR_INVALID_NAME = 123;
 inline constexpr DWORD ERROR_DIR_NOT_EMPTY = 145;
 inline constexpr DWORD ERROR_BUSY = 170;

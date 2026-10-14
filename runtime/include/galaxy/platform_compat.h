@@ -14,6 +14,20 @@
 
 #if !defined(_WIN32)
 
+// __rdtsc / _mm_pause: the runtime's cycle-count profiling and spin waits.
+// x86 hosts have the intrinsics; AArch64 reads the virtual counter (a fixed
+// frequency, not CPU cycles) and yields.
+#if defined(__x86_64__) || defined(__i386__)
+#include <x86intrin.h>
+#elif defined(__aarch64__)
+inline std::uint64_t __rdtsc() noexcept {
+    std::uint64_t value;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(value));
+    return value;
+}
+inline void _mm_pause() noexcept { __asm__ volatile("yield"); }
+#endif
+
 #include <clocale>
 #include <locale.h>
 #if defined(__APPLE__)
@@ -171,5 +185,26 @@ inline errno_t strncpy_s(char* destination, std::size_t size, const char* source
     destination[available] = '\0';
     return 0;
 }
+
+inline errno_t fopen_s(std::FILE** file, const char* path, const char* mode) noexcept {
+    if (file == nullptr) return EINVAL;
+    *file = std::fopen(path, mode);
+    return *file != nullptr ? 0 : errno;
+}
+
+// sscanf_s differs from sscanf only for %s/%c/%[ (which take a size); the
+// runtime uses it for numeric conversions alone.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#pragma GCC diagnostic ignored "-Wformat-security"
+#endif
+template <typename... Args>
+inline int sscanf_s(const char* text, const char* format, Args... args) noexcept {
+    return std::sscanf(text, format, args...);
+}
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 #endif
