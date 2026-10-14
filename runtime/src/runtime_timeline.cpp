@@ -9,37 +9,16 @@
 #include <Windows.h>
 #pragma comment(lib, "Synchronization.lib")
 #else
-// POSIX (Linux, macOS, iOS): a monotonic clock replaces QueryPerformanceCounter
-// and galaxy/host_event.h replaces the Win32 auto-reset events. The event
-// calls keep their Win32 names through the small shims below so the shared
-// broker code is unchanged.
-#include "galaxy/host_event.h"
-#include <cerrno>
+// POSIX (Linux, macOS, iOS): the Win32 events, waitable timers and thread
+// calls below come from the POSIX shim, so the deadline broker runs the same
+// code as on Windows; only the counter source differs (a monotonic clock in
+// place of QueryPerformanceCounter and the TSC).
+#include "galaxy/win32_fs.h"
+#include "galaxy/win32_host_posix.h"
 #include <time.h>
-#include <pthread.h>
 #if defined(__APPLE__)
 #include <mach/mach_time.h>
-#include <pthread/qos.h>
 #endif
-namespace {
-using HANDLE = void*;
-using DWORD = unsigned long;
-#ifndef FALSE
-#define FALSE 0  // Apple's mach headers already define it
-#endif
-inline HANDLE CreateEventW(void*, int, int, void*) noexcept {
-    return galaxy::host::event_create();
-}
-inline int SetEvent(HANDLE event) noexcept {
-    galaxy::host::event_signal(event);
-    return 1;
-}
-inline int CloseHandle(HANDLE event) noexcept {
-    galaxy::host::event_close(event);
-    return 1;
-}
-inline DWORD GetLastError() noexcept { return static_cast<DWORD>(errno); }
-}  // namespace
 #endif
 #include "galaxy/windows_power.h"
 #include "galaxy/frame_timeline.h"
@@ -197,7 +176,6 @@ std::chrono::nanoseconds timeline_wait_duration(
         std::chrono::nanoseconds(fractional_nanoseconds);
 }
 
-#if defined(_WIN32)
 void configure_deadline_worker_scheduling() {
     // The simulation thread runs at ABOVE_NORMAL and, when available, in the Games MMCSS class.
     // A default-priority broker can otherwise be starved by the thread whose hardware deadlines
@@ -400,39 +378,6 @@ public:
 private:
     HANDLE timer_{};
 };
-#else
-// POSIX: raise the broker toward the simulation thread's priority where the
-// platform lets an unprivileged process do so; failure is not fatal here.
-void configure_deadline_worker_scheduling() {
-#if defined(__APPLE__)
-    (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
-}
-
-class ScopedMmcssDeadlineWorker {};
-
-// Deadlines and schedule changes both arrive through the auto-reset event;
-// the timed wait covers the next deadline.
-class ScopedDeadlineWaitTimer {
-public:
-    void wait_for(HANDLE wake_event, std::chrono::nanoseconds duration) const {
-        if (wake_event == nullptr) {
-            throw std::runtime_error("deadline broker wake event is unavailable");
-        }
-        if (duration.count() <= 0) {
-            return;
-        }
-        (void)galaxy::host::event_wait(wake_event, duration);
-    }
-
-    void wait_for_signal(HANDLE wake_event) const {
-        if (wake_event == nullptr) {
-            throw std::runtime_error("deadline broker wake event is unavailable");
-        }
-        (void)galaxy::host::event_wait(wake_event);
-    }
-};
-#endif
 
 }  // namespace
 

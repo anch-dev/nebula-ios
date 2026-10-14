@@ -243,6 +243,21 @@ HANDLE CreateEventW(SECURITY_ATTRIBUTES* security, BOOL manual_reset, BOOL initi
                     const wchar_t* name) noexcept;
 BOOL SetEvent(HANDLE event) noexcept;
 BOOL ResetEvent(HANDLE event) noexcept;
+// Waitable timers (precise to the steady clock; synchronization timers are
+// auto-reset, CREATE_WAITABLE_TIMER_MANUAL_RESET makes a notification timer).
+inline constexpr DWORD CREATE_WAITABLE_TIMER_MANUAL_RESET = 0x1u;
+inline constexpr DWORD CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x2u;
+inline constexpr DWORD TIMER_QUERY_STATE = 0x1u;
+inline constexpr DWORD TIMER_MODIFY_STATE = 0x2u;
+inline constexpr DWORD TIMER_ALL_ACCESS = 0x1F0003u;
+using PTIMERAPCROUTINE = void (*)(void*, DWORD, DWORD);
+HANDLE CreateWaitableTimerExW(SECURITY_ATTRIBUTES* security, const wchar_t* name, DWORD flags,
+                              DWORD access) noexcept;
+// `due`: negative = relative, in 100 ns units; positive = absolute FILETIME
+// (UTC). Periodic timers and completion routines are not supported.
+BOOL SetWaitableTimer(HANDLE timer, const LARGE_INTEGER* due, LONG period,
+                      PTIMERAPCROUTINE routine, void* argument, BOOL resume) noexcept;
+BOOL CancelWaitableTimer(HANDLE timer) noexcept;
 DWORD WaitForSingleObject(HANDLE object, DWORD milliseconds) noexcept;
 DWORD WaitForMultipleObjects(DWORD count, const HANDLE* objects, BOOL wait_all,
                              DWORD milliseconds) noexcept;

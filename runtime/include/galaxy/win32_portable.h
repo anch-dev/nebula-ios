@@ -70,6 +70,15 @@ using HWND = void*;
 #ifndef FALSE
 #define FALSE 0  // Apple's mach headers may already define it
 #endif
+#ifndef WINAPI
+#define WINAPI
+#endif
+#ifndef CALLBACK
+#define CALLBACK
+#endif
+#ifndef STDMETHODCALLTYPE
+#define STDMETHODCALLTYPE
+#endif
 #define INVALID_HANDLE_VALUE (reinterpret_cast<HANDLE>(static_cast<std::intptr_t>(-1)))
 inline constexpr DWORD INFINITE = 0xFFFFFFFFu;
 inline constexpr DWORD MAX_PATH = 260u;

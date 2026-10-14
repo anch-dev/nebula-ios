@@ -66,7 +66,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <syncstream>
+#include "galaxy/sync_ostream.h"
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -192,7 +192,7 @@ void dump_native_ios_anomalies(const NativeIosAnomalyLedger& ledger) {
            << " overflow=" << ledger.overflow()
            << " invalid-wall=" << ledger.invalid_wall()
            << " unwound=" << ledger.unwound() << '\n';
-    std::osyncstream(std::cout) << output.str();
+    galaxy::osyncstream(std::cout) << output.str();
 }
 
 constexpr std::size_t kTextSectionCount = 7;
@@ -3379,7 +3379,7 @@ public:
                 std::memory_order_release);
             first_submit_thread_id_.store(
                 GetCurrentThreadId(), std::memory_order_release);
-            std::osyncstream(std::cout)
+            galaxy::osyncstream(std::cout)
                 << "[audio-init] first-submit=1 ready-before="
                 << (initialization_before.state ==
                             NativeAudioInitializationState::Ready
@@ -3516,7 +3516,7 @@ public:
                         if (FAILED(hr)) throw std::runtime_error("audio recovery COM initialization failed");
                         const ScopeExit release_com([]() noexcept { CoUninitialize(); });
                         rebuild_endpoint();
-                        std::osyncstream(std::cerr)
+                        galaxy::osyncstream(std::cerr)
                             << "[audio-device-recovery] elapsed-us="
                             << std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - recovery_started).count()
@@ -10975,7 +10975,7 @@ GuestAddressSpace* GuestAddressSpace::owner_of(const GuestMemoryV1* memory) noex
 void GuestAddressSpace::finish_async_disc_shutdown() {
     {
         const auto mram = dsp_native_mram_transactions_.snapshot();
-        std::osyncstream(std::cout)
+        galaxy::osyncstream(std::cout)
             << "[dsp-mram-audit] direct-reads="
             << dsp_native_direct_mram_reads_.load(std::memory_order_relaxed)
             << " direct-read-bytes="
@@ -10989,7 +10989,7 @@ void GuestAddressSpace::finish_async_disc_shutdown() {
     }
     if (!async_disc_) return;
     async_disc_->shutdown();
-    std::osyncstream(std::cout)
+    galaxy::osyncstream(std::cout)
         << "[async-disc-audit] enabled=1 submitted=" << async_disc_->submitted()
         << " completed=" << async_disc_->completed()
         << " bytes=" << async_disc_->bytes()
@@ -11235,7 +11235,7 @@ void GuestAddressSpace::finish_native_ios_shutdown() {
         else ++state.failed;
         state.pending.reset();
     }
-    std::osyncstream(std::cout)
+    galaxy::osyncstream(std::cout)
         << "[async-nand-audit] enabled=1 accepted=" << state.accepted
         << " completed=" << state.completed << " committed=" << state.committed
         << " failed=" << state.failed << " held-total=" << state.held_total
@@ -11515,7 +11515,7 @@ bool GuestAddressSpace::preinitialize_native_audio() {
             mode == NativeAudioPreinitializeMode::SkipWavDumpOnly
             ? "wav-dump-only"
             : "disabled";
-        std::osyncstream(std::cout)
+        galaxy::osyncstream(std::cout)
             << "[audio-init] pre-guest=1 mode=" << mode_name
             << " result=skipped total-us=0 attempts=0\n";
         return true;
@@ -11533,7 +11533,7 @@ bool GuestAddressSpace::preinitialize_native_audio() {
     const bool initialized = native_audio_->preinitialize();
     const AudioSinkStats initialization_stats = native_audio_->stats();
     std::ostream& output = initialized ? std::cout : std::cerr;
-    std::osyncstream line(output);
+    galaxy::osyncstream line(output);
     line << "[audio-init] pre-guest=1 mode=native result="
          << (initialized ? (native_audio_->output_available() ? "ready" : "waiting-for-device") : "failed")
          << " total-us=" << initialization_stats.preinitialize_elapsed_us
@@ -12013,7 +12013,7 @@ void GuestAddressSpace::dump_wgpipe_pe_ownership_trace() const {
         return records[(start + logical_index) % records.size()];
     };
 
-    std::osyncstream report(std::cerr);
+    galaxy::osyncstream report(std::cerr);
     report << "[wgpipe-pe-ownership] records="
            << (wgpipe_pe_trace_records_.size() +
                wgpipe_ownership_trace_records_.size())
@@ -18334,7 +18334,7 @@ void GuestAddressSpace::dsp_native_shutdown(
             galaxy::dsp_audio_causal_classify(snapshot);
         const auto channel_selection_state =
             galaxy::dsp_audio_causal_channel_selection_state(snapshot);
-        std::osyncstream report(std::cerr);
+        galaxy::osyncstream report(std::cerr);
         report << "[audio-causal] class="
                << galaxy::dsp_audio_causal_classification_name(classification)
                << " events=" << snapshot.total_events
@@ -18471,7 +18471,7 @@ void GuestAddressSpace::dsp_native_shutdown(
             galaxy::dsp_generated_probe_contract_compatible(
                 snapshot.generated_probe_contract_version,
                 snapshot.generated_probe_capabilities);
-        std::osyncstream report(std::cerr);
+        galaxy::osyncstream report(std::cerr);
         report << "[dsp-selection-dma-causal] identity="
                << (generated_contract_valid
                        ? "validated-rmge01-selected-channel-render-v1"

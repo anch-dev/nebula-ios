@@ -6,6 +6,7 @@
 
 #include "galaxy/win32_fs.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -374,6 +375,33 @@ void test_events_and_mappings() {
     setter.join();
     check(WaitForSingleObject(automatic, 30) == WAIT_TIMEOUT, "timed wait expires");
     check(CloseHandle(automatic) && CloseHandle(manual), "events close");
+
+    // Waitable timers: relative due times, precise wakes, cancel and re-arm.
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                          TIMER_MODIFY_STATE | SYNCHRONIZE);
+    HANDLE wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    check(timer != nullptr && wake != nullptr, "timer created");
+    LARGE_INTEGER due{};
+    due.QuadPart = -30'000;  // 3 ms
+    const auto begin = std::chrono::steady_clock::now();
+    check(SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE) != FALSE, "timer armed");
+    const HANDLE pair[] = {wake, timer};
+    check(WaitForMultipleObjects(2, pair, FALSE, INFINITE) == WAIT_OBJECT_0 + 1, "timer fires");
+    const auto waited = std::chrono::steady_clock::now() - begin;
+    check(waited >= std::chrono::microseconds(2900) && waited < std::chrono::milliseconds(200),
+          "timer fires at its due time");
+    check(WaitForSingleObject(timer, 0) == WAIT_TIMEOUT, "synchronization timer resets");
+    due.QuadPart = -50'000'000;  // 5 s
+    SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+    SetEvent(wake);
+    check(WaitForMultipleObjects(2, pair, FALSE, INFINITE) == WAIT_OBJECT_0, "event wins before the timer");
+    check(CancelWaitableTimer(timer) != FALSE, "cancel");
+    check(WaitForSingleObject(timer, 20) == WAIT_TIMEOUT, "cancelled timer never fires");
+    due.QuadPart = -10'000;
+    SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+    check(WaitForSingleObject(timer, 1000) == WAIT_OBJECT_0, "re-armed timer fires");
+    CloseHandle(timer);
+    CloseHandle(wake);
 
     write_text(p("pak"), "0123456789abcdef");
     HANDLE file = CreateFileW(p("pak").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,

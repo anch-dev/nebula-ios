@@ -108,7 +108,7 @@ constexpr std::uint32_t kHandleMagic = 0x57334653u;  // "W3FS"
 constexpr const char* kStreamXattrPrefix = "user.galaxy.stream.";
 constexpr std::size_t kStreamXattrPrefixLength = 19u;
 
-enum class Kind : std::uint8_t { File, Stream, StreamSearch, Event, Mapping };
+enum class Kind : std::uint8_t { File, Stream, StreamSearch, Event, Mapping, Timer };
 
 struct ObjectKey {
     dev_t device;
@@ -139,9 +139,11 @@ struct Handle {
     // Stream search
     std::vector<std::pair<std::wstring, std::int64_t>> streams;
     std::size_t next = 0;
-    // Event (state guarded by event_mutex())
+    // Event and timer (state guarded by event_mutex())
     bool manual_reset = false;
     bool signaled = false;
+    bool armed = false;
+    std::chrono::steady_clock::time_point due{};
     // Mapping (fd is a duplicate of the file's descriptor)
     std::uint64_t mapping_size = 0;
 };
@@ -1068,7 +1070,7 @@ BOOL CloseHandle(HANDLE object) noexcept {
     std::unique_ptr<Handle> owned(handle);
     BOOL result = TRUE;
     DWORD error = ERROR_SUCCESS;
-    if (handle->kind == Kind::Event) {
+    if (handle->kind == Kind::Event || handle->kind == Kind::Timer) {
         // Waiters hold no reference; closing while waited on is a caller bug
         // on Windows too.
         const std::lock_guard<std::mutex> lock(galaxy::win32::event_mutex());
@@ -1649,56 +1651,128 @@ DWORD WaitForMultipleObjects(DWORD count, const HANDLE* objects, BOOL wait_all,
         SetLastError(ERROR_INVALID_PARAMETER);
         return WAIT_FAILED;
     }
-    std::vector<Handle*> events;
+    std::vector<Handle*> waitables;
     try {
-        events.reserve(count);
+        waitables.reserve(count);
     } catch (...) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return WAIT_FAILED;
     }
     for (DWORD i = 0; i < count; ++i) {
-        Handle* const event = as_handle(objects[i]);
-        if (event == nullptr || event->kind != Kind::Event) {
+        Handle* const object = as_handle(objects[i]);
+        if (object == nullptr || (object->kind != Kind::Event && object->kind != Kind::Timer)) {
             SetLastError(ERROR_INVALID_HANDLE);
             return WAIT_FAILED;
         }
-        events.push_back(event);
+        waitables.push_back(object);
     }
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point started = Clock::now();
+    const bool forever = milliseconds == INFINITE;
+    const Clock::time_point deadline = started + std::chrono::milliseconds(forever ? 0u : milliseconds);
     std::unique_lock<std::mutex> lock(galaxy::win32::event_mutex());
-    // Returns the satisfied index (consuming auto-reset signals) or -1.
-    const auto ready = [&]() -> long {
-        if (wait_all != FALSE) {
-            for (Handle* event : events) {
-                if (!event->signaled) return -1;
+    // Fires due timers; returns the satisfied index (consuming auto-reset
+    // signals) or -1.
+    const auto ready = [&](Clock::time_point now) -> long {
+        for (Handle* object : waitables) {
+            if (object->kind == Kind::Timer && object->armed && now >= object->due) {
+                object->armed = false;
+                object->signaled = true;
             }
-            for (Handle* event : events) {
-                if (!event->manual_reset) event->signaled = false;
+        }
+        if (wait_all != FALSE) {
+            for (Handle* object : waitables) {
+                if (!object->signaled) return -1;
+            }
+            for (Handle* object : waitables) {
+                if (!object->manual_reset) object->signaled = false;
             }
             return 0;
         }
         for (DWORD i = 0; i < count; ++i) {
-            if (events[i]->signaled) {
-                if (!events[i]->manual_reset) events[i]->signaled = false;
+            if (waitables[i]->signaled) {
+                if (!waitables[i]->manual_reset) waitables[i]->signaled = false;
                 return static_cast<long>(i);
             }
         }
         return -1;
     };
-    long index = ready();
-    if (index < 0 && milliseconds != 0u) {
-        if (milliseconds == INFINITE) {
-            galaxy::win32::event_condition().wait(lock, [&] { return (index = ready()) >= 0; });
+    for (;;) {
+        const Clock::time_point now = Clock::now();
+        const long index = ready(now);
+        if (index >= 0) {
+            SetLastError(ERROR_SUCCESS);
+            return WAIT_OBJECT_0 + static_cast<DWORD>(index);
+        }
+        if (!forever && now >= deadline) {
+            SetLastError(ERROR_SUCCESS);
+            return WAIT_TIMEOUT;
+        }
+        // Sleep until a signal, the next timer, or the wait's deadline.
+        Clock::time_point wake = forever ? Clock::time_point::max() : deadline;
+        for (Handle* object : waitables) {
+            if (object->kind == Kind::Timer && object->armed && object->due < wake) wake = object->due;
+        }
+        if (wake == Clock::time_point::max()) {
+            galaxy::win32::event_condition().wait(lock);
         } else {
-            galaxy::win32::event_condition().wait_for(
-                lock, std::chrono::milliseconds(milliseconds), [&] { return (index = ready()) >= 0; });
+            galaxy::win32::event_condition().wait_until(lock, wake);
         }
     }
-    if (index < 0) {
-        SetLastError(ERROR_SUCCESS);
-        return WAIT_TIMEOUT;
+}
+
+HANDLE CreateWaitableTimerExW(SECURITY_ATTRIBUTES*, const wchar_t* name, DWORD flags,
+                              DWORD) noexcept {
+    if (name != nullptr) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
     }
+    auto* const timer = new (std::nothrow) Handle{};
+    if (timer == nullptr) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+    timer->kind = Kind::Timer;
+    timer->manual_reset = (flags & CREATE_WAITABLE_TIMER_MANUAL_RESET) != 0u;
     SetLastError(ERROR_SUCCESS);
-    return WAIT_OBJECT_0 + static_cast<DWORD>(index);
+    return timer;
+}
+
+BOOL SetWaitableTimer(HANDLE object, const LARGE_INTEGER* due, LONG period, PTIMERAPCROUTINE routine,
+                      void*, BOOL) noexcept {
+    Handle* const timer = as_handle(object);
+    if (timer == nullptr || timer->kind != Kind::Timer || due == nullptr) {
+        return fail_bool(ERROR_INVALID_HANDLE);
+    }
+    if (period != 0 || routine != nullptr) return fail_bool(ERROR_NOT_SUPPORTED);
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point when;
+    if (due->QuadPart < 0) {
+        when = Clock::now() + std::chrono::nanoseconds(-due->QuadPart * 100);
+    } else {
+        // Absolute FILETIME (100 ns since 1601) mapped onto the steady clock.
+        constexpr long long kUnixEpochTicks = 116444736000000000ll;
+        const auto unix_ns = std::chrono::nanoseconds((due->QuadPart - kUnixEpochTicks) * 100);
+        const auto system_now = std::chrono::system_clock::now().time_since_epoch();
+        when = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                                  unix_ns - std::chrono::duration_cast<std::chrono::nanoseconds>(system_now));
+    }
+    {
+        const std::lock_guard<std::mutex> lock(galaxy::win32::event_mutex());
+        timer->signaled = false;
+        timer->armed = true;
+        timer->due = when;
+    }
+    galaxy::win32::event_condition().notify_all();  // waiters recompute their wake time
+    return TRUE;
+}
+
+BOOL CancelWaitableTimer(HANDLE object) noexcept {
+    Handle* const timer = as_handle(object);
+    if (timer == nullptr || timer->kind != Kind::Timer) return fail_bool(ERROR_INVALID_HANDLE);
+    const std::lock_guard<std::mutex> lock(galaxy::win32::event_mutex());
+    timer->armed = false;
+    return TRUE;
 }
 
 DWORD WaitForSingleObject(HANDLE object, DWORD milliseconds) noexcept {

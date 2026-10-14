@@ -45,6 +45,12 @@ if(galaxy_can_run_tests)
     add_test(NAME flat_guest_memory_posix COMMAND galaxy_flat_guest_memory_posix_tests)
 endif()
 
+# Win32 vocabulary for POSIX hosts (files, events, timers, threads, window).
+add_library(galaxy_win32_posix STATIC
+    runtime/src/win32_fs_posix.cpp
+    runtime/src/win32_host_posix.cpp)
+target_link_libraries(galaxy_win32_posix PUBLIC galaxy_runtime_abi Threads::Threads ${CMAKE_DL_LIBS})
+
 # Portable runtime libraries (same names and sources as on Windows).
 add_library(galaxy_native_dsp STATIC runtime/src/native_dsp.cpp)
 target_link_libraries(galaxy_native_dsp PUBLIC galaxy_dsp_alu galaxy_runtime_abi)
@@ -62,8 +68,6 @@ add_library(galaxy_native_input STATIC
 target_link_libraries(galaxy_native_input PUBLIC galaxy_runtime_abi)
 add_library(galaxy_jaudio_mixer STATIC runtime/src/jaudio_host_mixer.cpp)
 target_link_libraries(galaxy_jaudio_mixer PUBLIC galaxy_runtime_abi)
-add_library(galaxy_host_event STATIC runtime/src/host_event.cpp)
-target_link_libraries(galaxy_host_event PUBLIC galaxy_runtime_abi Threads::Threads)
 add_library(galaxy_atomic_file STATIC runtime/src/atomic_file.cpp)
 target_link_libraries(galaxy_atomic_file PUBLIC galaxy_runtime_abi)
 add_library(galaxy_runtime_instance STATIC runtime/src/runtime_instance.cpp)
@@ -73,15 +77,11 @@ add_library(galaxy_runtime_settings STATIC
     runtime/src/input_bindings.cpp)
 target_link_libraries(galaxy_runtime_settings PUBLIC galaxy_runtime_abi galaxy_atomic_file)
 add_library(galaxy_runtime_timeline STATIC runtime/src/runtime_timeline.cpp)
-target_link_libraries(galaxy_runtime_timeline PUBLIC galaxy_runtime_abi galaxy_host_event)
+target_link_libraries(galaxy_runtime_timeline PUBLIC galaxy_runtime_abi galaxy_win32_posix)
 add_library(galaxy_frame_telemetry STATIC runtime/src/frame_telemetry.cpp)
 target_link_libraries(galaxy_frame_telemetry PUBLIC galaxy_runtime_abi)
 
 # POSIX Win32 shims and the host (memory, disc, saves, audio, input).
-add_library(galaxy_win32_posix STATIC
-    runtime/src/win32_fs_posix.cpp
-    runtime/src/win32_host_posix.cpp)
-target_link_libraries(galaxy_win32_posix PUBLIC galaxy_runtime_abi Threads::Threads ${CMAKE_DL_LIBS})
 
 set(galaxy_native_host_sources
     runtime/src/native_host.cpp
