@@ -911,9 +911,13 @@ public:
                 return snapshot;
             }
         }
-        snapshot.apply_calls = frequency_ratio_apply_calls_.load(std::memory_order_acquire);
+        // Not one callback's state, but still ordered: every change or error
+        // is counted after its apply call, so reading those counters first
+        // keeps change_actions and apply_errors <= apply_calls. (A busy
+        // callback thread on a weakly ordered many-core host reaches this.)
         snapshot.change_actions = frequency_ratio_change_actions_.load(std::memory_order_acquire);
         snapshot.apply_errors = frequency_ratio_apply_errors_.load(std::memory_order_acquire);
+        snapshot.apply_calls = frequency_ratio_apply_calls_.load(std::memory_order_acquire);
         snapshot.coherent = false;
         return snapshot;
     }
