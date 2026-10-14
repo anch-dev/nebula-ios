@@ -21,7 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
-#include <immintrin.h>  // SSE2 + SSSE3 pshufb decode kernels
+#include "galaxy/simd_compat.h"  // SSE2 + SSSE3 pshufb decode kernels (NEON via sse2neon)
 #include <cassert>
 #include <cerrno>
 #include <chrono>

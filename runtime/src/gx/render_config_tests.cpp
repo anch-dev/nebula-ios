@@ -1,8 +1,14 @@
 #include "galaxy/gx/render_config.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#include <process.h>
+#else
+#include "galaxy/platform_compat.h"
+#include "galaxy/win32_fs.h"
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -14,7 +20,6 @@
 #include <iterator>
 #include <limits>
 #include <cmath>
-#include <process.h>
 #include <string>
 
 namespace {
@@ -194,7 +199,8 @@ int main() {
         }
         {
             const auto unicode_path = root / L"\u03a9-\u65e5-settings.ini";
-            ScopedWideEnv unicode_override(L"GALAXY_RENDER_CONFIG_PATH", unicode_path.c_str());
+            const std::wstring unicode_path_text = unicode_path.wstring();
+            ScopedWideEnv unicode_override(L"GALAXY_RENDER_CONFIG_PATH", unicode_path_text.c_str());
             galaxy::gx::RenderConfig value{};
             value.max_fps = 59.940002f;
             galaxy::gx::set_render_config(value);
@@ -383,6 +389,9 @@ int main() {
                 galaxy::gx::get_render_config().efb_scale == galaxy::gx::kMaxEfbScale,
             "saved config contains the staged scale while the live scale remains unchanged");
 
+#if defined(_WIN32)
+        // Failure injection through a Windows share-mode lock; the POSIX
+        // atomic writer's failure paths are covered by atomic_file_tests.
         HANDLE locked = CreateFileW(
             path.c_str(),
             GENERIC_READ,
@@ -409,6 +418,7 @@ int main() {
         if (locked != INVALID_HANDLE_VALUE) {
             (void)CloseHandle(locked);
         }
+#endif
         galaxy::gx::stage_next_start_efb_scale(2u);
         passed &= expect(
             galaxy::gx::save_render_config_to_file(),

@@ -21,7 +21,7 @@
 #include "galaxy/gx/renderer_d3d12.h"
 #include "galaxy/native_api.h"
 
-#include <emmintrin.h>
+#include "galaxy/simd_compat.h"
 
 #include <algorithm>
 #include <array>

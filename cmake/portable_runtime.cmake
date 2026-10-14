@@ -241,3 +241,173 @@ target_include_directories(galaxy_native_runtime_objects PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src"
     "${CMAKE_CURRENT_BINARY_DIR}")
+
+# HLSL -> MSL translation for the Metal renderer (glslang + SPIRV-Cross,
+# fetched at pinned releases). Also built on Linux so CI checks every
+# shader translates.
+option(GALAXY_SHADER_TRANSLATOR "Build the HLSL to MSL shader translator" ON)
+if(GALAXY_SHADER_TRANSLATOR)
+    include(FetchContent)
+    set(galaxy_khronos_tag vulkan-sdk-1.4.341.0)
+    FetchContent_Declare(glslang
+        GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+        GIT_TAG ${galaxy_khronos_tag}
+        GIT_SHALLOW TRUE)
+    FetchContent_Declare(spirv_cross
+        GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
+        GIT_TAG ${galaxy_khronos_tag}
+        GIT_SHALLOW TRUE)
+    set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+    set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+    set(ENABLE_HLSL ON CACHE BOOL "" FORCE)
+    set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_CPP OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_ENABLE_UTIL OFF CACHE BOOL "" FORCE)
+    set(SPIRV_CROSS_SKIP_INSTALL ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(glslang spirv_cross)
+
+    add_library(galaxy_shader_translate STATIC runtime/src/gx/shader_translate.cpp)
+    target_include_directories(galaxy_shader_translate PUBLIC "${galaxy_runtime_include}")
+    # glslang's headers declare the HLSL-only setters under this macro.
+    target_compile_definitions(galaxy_shader_translate PRIVATE ENABLE_HLSL)
+    target_link_libraries(galaxy_shader_translate
+        PRIVATE glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits
+                spirv-cross-msl spirv-cross-glsl spirv-cross-core)
+endif()
+
+# The renderer-independent half of galaxy_gx: FIFO parsing, GX state, shader
+# keys and generation, render configuration. The Metal renderer (step 7)
+# builds on it.
+set(galaxy_uber_embed_cpp "${CMAKE_CURRENT_BINARY_DIR}/generated/uber_shader_embed.cpp")
+set(galaxy_uber_embed_body "")
+foreach(galaxy_uber_stage vs ps)
+    set(galaxy_uber_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src/gx/uber_${galaxy_uber_stage}.hlsl")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${galaxy_uber_hlsl}")
+    file(READ "${galaxy_uber_hlsl}" galaxy_uber_hex HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," galaxy_uber_hex "${galaxy_uber_hex}")
+    string(APPEND galaxy_uber_embed_body
+        "extern const char galaxy_uber_${galaxy_uber_stage}_hlsl[] = {${galaxy_uber_hex}0x00};\n")
+endforeach()
+file(CONFIGURE OUTPUT "${galaxy_uber_embed_cpp}"
+    CONTENT "namespace galaxy::gx {\n${galaxy_uber_embed_body}}\n"
+    @ONLY)
+
+add_library(galaxy_gx_core STATIC
+    runtime/src/gx/fifo_parser.cpp
+    runtime/src/gx/gx_state.cpp
+    runtime/src/gx/shader_keys.cpp
+    runtime/src/gx/shader_gen.cpp
+    runtime/src/gx/uber_shaders.cpp
+    "${galaxy_uber_embed_cpp}"
+    runtime/src/gx/render_config.cpp
+    runtime/src/gx/transform_history.cpp
+    runtime/src/gx/line_point_raster.cpp
+    runtime/src/gx/game_asset_extract.cpp)
+target_include_directories(galaxy_gx_core PUBLIC "${galaxy_runtime_include}")
+target_link_libraries(galaxy_gx_core PUBLIC galaxy_win32_posix galaxy_atomic_file Threads::Threads)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    # The texture and FIFO kernels use SSSE3 (pshufb), as on Windows.
+    target_compile_options(galaxy_gx_core PUBLIC -mssse3)
+endif()
+
+foreach(name IN ITEMS fifo_parser_tests owned_fifo_packet_tests dependency_event_capture_tests
+        sorted_dirty_ranges_tests transform_history_tests vs_constants_tests
+        game_asset_extract_tests render_config_tests)
+    galaxy_portable_test(${name} SOURCES runtime/src/gx/${name}.cpp LIBS galaxy_gx_core)
+endforeach()
+
+if(GALAXY_SHADER_TRANSLATOR AND galaxy_can_run_tests)
+    if(APPLE)
+        enable_language(OBJCXX)
+        set(galaxy_msl_check runtime/src/gx/shader_msl_check_metal.mm)
+    else()
+        set(galaxy_msl_check runtime/src/gx/shader_msl_check_none.cpp)
+    endif()
+    galaxy_portable_test(shader_gen_tests
+        SOURCES runtime/src/gx/shader_gen_tests.cpp ${galaxy_msl_check}
+        LIBS galaxy_gx_core galaxy_shader_translate)
+    target_include_directories(galaxy_shader_gen_tests PRIVATE runtime/src/gx)
+    if(APPLE)
+        target_link_libraries(galaxy_shader_gen_tests PRIVATE
+            "-framework Metal" "-framework Foundation")
+        set_source_files_properties(runtime/src/gx/shader_msl_check_metal.mm
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    endif()
+endif()
+
+# Presentation post-processing passes, composed exactly as the Windows build
+# composes them for fxc (runtime/src/gx/post_process.hlsl with the vendored
+# SMAA and FSR 1 sources). The Metal renderer translates the same sources;
+# post_shader_translate_tests checks every pass.
+set(galaxy_post_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/post_shaders")
+file(MAKE_DIRECTORY "${galaxy_post_dir}")
+set(galaxy_post_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src/gx/post_process.hlsl")
+set(galaxy_smaa_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/third_party/smaa/SMAA.hlsl")
+set(galaxy_ffx_a_h "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fidelityfx-fsr1/ffx_a.h")
+set(galaxy_ffx_fsr1_h "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fidelityfx-fsr1/ffx_fsr1.h")
+foreach(galaxy_post_input
+        "${galaxy_post_hlsl}" "${galaxy_smaa_hlsl}" "${galaxy_ffx_a_h}" "${galaxy_ffx_fsr1_h}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${galaxy_post_input}")
+endforeach()
+file(READ "${galaxy_post_hlsl}" galaxy_post_src)
+file(READ "${galaxy_smaa_hlsl}" galaxy_smaa_src)
+file(READ "${galaxy_ffx_a_h}" galaxy_ffx_a_src)
+file(READ "${galaxy_ffx_fsr1_h}" galaxy_ffx_fsr1_src)
+set(galaxy_post_list "")
+function(galaxy_post_shader name pass preset library stage entry)
+    set(text "#define ${pass} 1\n")
+    if(NOT preset STREQUAL "-")
+        string(APPEND text "#define ${preset} 1\n")
+    endif()
+    string(APPEND text "#define POST_SECTION 1\n${galaxy_post_src}\n")
+    if(library STREQUAL "smaa")
+        string(APPEND text "${galaxy_smaa_src}\n")
+    elseif(library STREQUAL "fsr")
+        string(APPEND text "${galaxy_ffx_a_src}\n#undef POST_SECTION\n#define POST_SECTION 2\n"
+            "${galaxy_post_src}\n${galaxy_ffx_fsr1_src}\n")
+    endif()
+    string(APPEND text "#undef POST_SECTION\n#define POST_SECTION 3\n${galaxy_post_src}\n")
+    set(source "${galaxy_post_dir}/${name}.hlsl")
+    file(WRITE "${source}.tmp" "${text}")
+    configure_file("${source}.tmp" "${source}" COPYONLY)
+    set(galaxy_post_list "${galaxy_post_list}    {\"${name}\", \"${source}\", '${stage}', \"${entry}\"},\n"
+        PARENT_SCOPE)
+endfunction()
+galaxy_post_shader(post_fullscreen_vs PASS_RESAMPLE - none v VSMain)
+galaxy_post_shader(post_resample_ps PASS_RESAMPLE - none p PSMain)
+galaxy_post_shader(post_fxaa_ps PASS_FXAA - none p PSMain)
+galaxy_post_shader(post_fsr_easu_ps PASS_FSR_EASU - fsr p PSMain)
+galaxy_post_shader(post_fsr_rcas_ps PASS_FSR_RCAS - fsr p PSMain)
+galaxy_post_shader(post_smaa_edges_vs PASS_SMAA_EDGES SMAA_PRESET_HIGH smaa v VSMain)
+galaxy_post_shader(post_smaa_blend_vs PASS_SMAA_BLEND SMAA_PRESET_HIGH smaa v VSMain)
+galaxy_post_shader(post_smaa_blend_ps PASS_SMAA_BLEND SMAA_PRESET_HIGH smaa p PSMain)
+foreach(galaxy_smaa_preset LOW MEDIUM HIGH ULTRA)
+    string(TOLOWER "${galaxy_smaa_preset}" galaxy_smaa_suffix)
+    galaxy_post_shader(post_smaa_edges_ps_${galaxy_smaa_suffix}
+        PASS_SMAA_EDGES SMAA_PRESET_${galaxy_smaa_preset} smaa p PSMain)
+    galaxy_post_shader(post_smaa_weights_vs_${galaxy_smaa_suffix}
+        PASS_SMAA_WEIGHTS SMAA_PRESET_${galaxy_smaa_preset} smaa v VSMain)
+    galaxy_post_shader(post_smaa_weights_ps_${galaxy_smaa_suffix}
+        PASS_SMAA_WEIGHTS SMAA_PRESET_${galaxy_smaa_preset} smaa p PSMain)
+endforeach()
+file(CONFIGURE OUTPUT "${galaxy_post_dir}/post_shader_list.h"
+    CONTENT "// Generated by cmake/portable_runtime.cmake.\n#pragma once\nstruct PostShaderSource { const char* name; const char* path; char stage; const char* entry; };\ninline constexpr PostShaderSource kPostShaders[] = {\n${galaxy_post_list}};\n"
+    @ONLY)
+
+if(GALAXY_SHADER_TRANSLATOR AND galaxy_can_run_tests)
+    galaxy_portable_test(post_shader_translate_tests
+        SOURCES runtime/src/gx/post_shader_translate_tests.cpp ${galaxy_msl_check}
+        LIBS galaxy_shader_translate)
+    target_include_directories(galaxy_post_shader_translate_tests PRIVATE
+        runtime/src/gx "${galaxy_post_dir}")
+    if(APPLE)
+        target_link_libraries(galaxy_post_shader_translate_tests PRIVATE
+            "-framework Metal" "-framework Foundation")
+    endif()
+endif()

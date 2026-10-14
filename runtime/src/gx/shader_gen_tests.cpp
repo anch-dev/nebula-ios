@@ -7,7 +7,12 @@
 // z-texturing and alpha-test permutations. Each generated shader is passed to D3DCompile.
 //
 // Exit code = number of failures (0 = pass).
+//
+// On the Apple port (non-Windows hosts) each shader is instead translated to
+// MSL (galaxy/gx/shader_translate.h) and, where Metal is available, compiled
+// by it (shader_msl_check.h).
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #pragma warning(push, 0)
@@ -15,6 +20,10 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #pragma warning(pop)
+#else
+#include "galaxy/gx/shader_translate.h"
+#include "shader_msl_check.h"
+#endif
 
 #include "galaxy/gx/shader_gen.h"
 #include "galaxy/gx/shader_keys.h"
@@ -33,18 +42,22 @@
 
 #include "galaxy/gx/uber_shaders.h"
 
+#if defined(_WIN32)
 #include <d3d12shader.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
+#endif
 
 namespace {
 
 int g_failures = 0;
 
+#if defined(_WIN32)
 void check_compiles(
     const std::string& src,
     const char* target,
-    const char* label) {
+    const char* label,
+    bool = false) {
     Microsoft::WRL::ComPtr<ID3DBlob> code, errors;
     const HRESULT hr = D3DCompile(
         src.data(), src.size(), label, nullptr, nullptr, "main", target,
@@ -63,6 +76,40 @@ void check_compiles(
         std::printf("ok: %s\n", label);
     }
 }
+#else
+void check_compiles(
+    const std::string& src,
+    const char* target,
+    const char* label,
+    bool dual_source_blend = false) {
+    namespace xlate = galaxy::gx::xlate;
+    xlate::Options options;
+    options.label = label;
+    options.dual_source_blend = dual_source_blend;
+    const xlate::Stage stage = target[0] == 'v' ? xlate::Stage::Vertex
+                             : target[0] == 'p' ? xlate::Stage::Pixel
+                                                : xlate::Stage::Compute;
+    if (target[0] == 'g') {
+        // Metal has no geometry stage; the Metal renderer expands GX lines
+        // and points another way.
+        std::printf("skipped (geometry): %s\n", label);
+        return;
+    }
+    const xlate::Result result = xlate::hlsl_to_msl(src, stage, options);
+    std::string metal_error;
+    if (!result.ok) {
+        ++g_failures;
+        std::printf("FAILED: %s (%s -> MSL)\n%s\n--- source ---\n%s\n",
+            label, target, result.log.c_str(), src.c_str());
+    } else if (!galaxy_test::msl_compiles(result.msl, label, metal_error)) {
+        ++g_failures;
+        std::printf("FAILED: %s (Metal)\n%s\n--- MSL ---\n%s\n",
+            label, metal_error.c_str(), result.msl.c_str());
+    } else {
+        std::printf("ok: %s\n", label);
+    }
+}
+#endif
 
 // Raw XF channel-control word (gx_bitfields.h decode_xf_channel_ctrl):
 // matsource(0) | enable(1) | lightmask0_3(2-5) | ambsource(6) |
@@ -159,6 +206,7 @@ galaxy::gx::TevStagePacked basic_stage() {
 }
 
 void check_independent_pair_compilation() {
+#if defined(_WIN32)
     using Blob = Microsoft::WRL::ComPtr<ID3DBlob>;
     const auto compile = [](
         const std::string& source, const char* target, const char* label) {
@@ -225,6 +273,7 @@ void check_independent_pair_compilation() {
         ++g_failures;
         std::printf("FAILED: shader_pair_bytecode: %s\n", error.what());
     }
+#endif
 
     // Exceptional cleanup must hold when a pixel-side failure happens while the compiler is running.
     std::promise<void> vertex_started;
@@ -527,6 +576,9 @@ int main() {
             check_contains(src, (variant & 1u) != 0u ? "motion_ctrl.x == 0u"
                                                      : "dot(motion_prev_pos[0], float4(pos_in",
                            label);
+#if !defined(_WIN32)
+            check_compiles(src, "vs_5_1", label);
+#else
             Microsoft::WRL::ComPtr<ID3DBlob> code, errors;
             const HRESULT hr = D3DCompile(src.data(), src.size(), label, nullptr, nullptr,
                 "main", "vs_5_1", D3DCOMPILE_ENABLE_STRICTNESS |
@@ -555,6 +607,7 @@ int main() {
                     std::printf("ok: %s\n", label);
                 }
             }
+#endif
         }
         for (unsigned variant = 0; variant < 3u; ++variant) {
             PixelShaderKey k{};
@@ -1095,7 +1148,7 @@ int main() {
                        "ps_dual_src_preserves_tev_alpha");
         check_contains(src, "uint dst_alpha6 = uint(round(saturate(alpha_refs.w)",
                        "ps_dual_src_writes_constant");
-        check_compiles(src, "ps_5_1", "ps_dual_src_compiles");
+        check_compiles(src, "ps_5_1", "ps_dual_src_compiles", true);
     }
 
     {   // Dual-source dst-alpha combined with Z-texturing (PSOutZ + Target1
@@ -1113,7 +1166,7 @@ int main() {
         const std::string src = gen.generate_ps(k);
         check_contains(src, "float4 color1 : SV_Target1;",
                        "ps_dual_src_ztex_declares_target1");
-        check_compiles(src, "ps_5_1", "ps_dual_src_ztex_compiles");
+        check_compiles(src, "ps_5_1", "ps_dual_src_ztex_compiles", true);
     }
 
     {
@@ -1289,7 +1342,8 @@ int main() {
             source += "\n";
             source += uber_ps_source();
             const std::string label = "uber_ps_variant_" + std::to_string(variant);
-            check_compiles(source, "ps_5_1", label.c_str());
+            check_compiles(source, "ps_5_1", label.c_str(),
+                           uber_ps_variant_dual_source(variant));
         }
         PixelShaderKey key{};
         const auto expect_variant = [&](std::uint8_t flags, unsigned expected) {

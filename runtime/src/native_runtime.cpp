@@ -56,6 +56,7 @@
 #include "galaxy/host_fiber.h"
 #include "galaxy/platform_compat.h"
 #include "galaxy/portable_hash.h"
+#include "galaxy/simd_compat.h"  // _mm_pause
 #include "galaxy/win32_fs.h"
 #include "galaxy/win32_host_posix.h"
 #include <csignal>

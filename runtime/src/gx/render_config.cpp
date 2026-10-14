@@ -3,8 +3,13 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#if defined(_WIN32)
 #include <Windows.h>
 #include <Shlobj.h>
+#else
+#include "galaxy/platform_compat.h"
+#include "galaxy/win32_portable.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -375,6 +380,31 @@ static bool experimental_frame_rate_decouple_allowed() {
     return read_env_bool("GALAXY_EXPERIMENTAL_FRAME_RATE_DECOUPLE", false);
 }
 
+#if !defined(_WIN32)
+// POSIX: GALAXY_RENDER_CONFIG_PATH, else config.ini in the per-user
+// configuration directory (Apple: ~/Library/Application Support/Nebula,
+// Linux: XDG config), beside runtime_settings.ini.
+static std::filesystem::path config_path() {
+    if (const char* const override_value = std::getenv("GALAXY_RENDER_CONFIG_PATH")) {
+        // An explicitly empty override never falls back to the default.
+        if (override_value[0] == '\0') return {};
+        return std::filesystem::path(override_value);
+    }
+    const char* const home = std::getenv("HOME");
+#if defined(__APPLE__)
+    if (home == nullptr || home[0] == '\0') return {};
+    return std::filesystem::path(home) / "Library" / "Application Support" / "Nebula" /
+           "config.ini";
+#else
+    const char* const config = std::getenv("XDG_CONFIG_HOME");
+    if (config != nullptr && config[0] != '\0') {
+        return std::filesystem::path(config) / "Nebula" / "config.ini";
+    }
+    if (home == nullptr || home[0] == '\0') return {};
+    return std::filesystem::path(home) / ".config" / "Nebula" / "config.ini";
+#endif
+}
+#else
 static std::filesystem::path config_path() {
     SetLastError(ERROR_SUCCESS);
     const DWORD required = GetEnvironmentVariableW(L"GALAXY_RENDER_CONFIG_PATH", nullptr, 0);
@@ -397,6 +427,7 @@ static std::filesystem::path config_path() {
     }
     return std::filesystem::path(app_data) / L"Nebula" / L"config.ini";
 }
+#endif
 
 }  // namespace
 

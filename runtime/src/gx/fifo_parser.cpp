@@ -13,7 +13,7 @@
 #include "galaxy/gx/fifo_parser.h"
 #include "galaxy/gx/snapshot_region_lookup.h"
 
-#include <immintrin.h>  // SSSE3 pshufb
+#include "galaxy/simd_compat.h"  // SSSE3 pshufb (NEON via sse2neon on AArch64)
 
 #include <algorithm>
 #include <array>

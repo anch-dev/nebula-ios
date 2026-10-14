@@ -11,12 +11,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#if !defined(_WIN32)
+#include <strings.h>
+#include <unistd.h>
+#include <wctype.h>
+#endif
 
 #if !defined(_WIN32)
 
-// __rdtsc / _mm_pause: the runtime's cycle-count profiling and spin waits.
-// x86 hosts have the intrinsics; AArch64 reads the virtual counter (a fixed
-// frequency, not CPU cycles) and yields.
+// __rdtsc: the runtime's cycle-count profiling. x86 hosts have the
+// intrinsic; AArch64 reads the virtual counter (a fixed frequency, not CPU
+// cycles). (_mm_pause comes from galaxy/simd_compat.h; this header must not
+// pull in arm_neon.h, whose float32_t clashes with SoftFloat's.)
 #if defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>
 #elif defined(__aarch64__)
@@ -25,7 +32,6 @@ inline std::uint64_t __rdtsc() noexcept {
     __asm__ volatile("mrs %0, cntvct_el0" : "=r"(value));
     return value;
 }
-inline void _mm_pause() noexcept { __asm__ volatile("yield"); }
 #endif
 
 #include <clocale>
@@ -190,6 +196,28 @@ inline errno_t fopen_s(std::FILE** file, const char* path, const char* mode) noe
     if (file == nullptr) return EINVAL;
     *file = std::fopen(path, mode);
     return *file != nullptr ? 0 : errno;
+}
+
+// _wfopen_s with a std::filesystem::path::c_str() (narrow on POSIX) and an
+// ASCII wide mode string.
+inline errno_t _wfopen_s(std::FILE** file, const char* path, const wchar_t* mode) noexcept {
+    char narrow_mode[8]{};
+    for (std::size_t i = 0; i + 1u < sizeof(narrow_mode) && mode[i] != L'\0'; ++i) {
+        narrow_mode[i] = static_cast<char>(mode[i]);
+    }
+    return fopen_s(file, path, narrow_mode);
+}
+
+inline int _getpid() noexcept { return static_cast<int>(::getpid()); }
+
+inline int _stricmp(const char* left, const char* right) noexcept {
+    return ::strcasecmp(left, right);
+}
+inline int _strnicmp(const char* left, const char* right, std::size_t count) noexcept {
+    return ::strncasecmp(left, right, count);
+}
+inline int _wcsicmp(const wchar_t* left, const wchar_t* right) noexcept {
+    return ::wcscasecmp(left, right);
 }
 
 // sscanf_s differs from sscanf only for %s/%c/%[ (which take a size); the

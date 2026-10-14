@@ -88,6 +88,24 @@ Windows MSVC job builds the original runtime and runs its tests to catch
 regressions. Locally they also pass on x86-64 and AArch64 under QEMU (the
 timeline race test can time out under heavy QEMU load only).
 
+7a. **Renderer groundwork** —
+   - *Shaders*: every renderer shader is HLSL. The Metal renderer
+     translates them at run time instead of keeping MSL copies:
+     `shader_translate.h` runs glslang (HLSL → SPIR-V) and SPIRV-Cross
+     (SPIR-V → MSL), fetched at a pinned Vulkan SDK release. Bindings keep
+     the D3D12 register numbers (bN → buffer N, tN → texture N, sN →
+     sampler N, space1 → buffers from 8), constant buffers keep HLSL
+     packing and row-major matrices, interstage values are placed by
+     semantic, and dual-source blending maps to `[[color(0), index(1)]]`.
+     `shader_gen_tests` (upstream's corpus of ~250 generated shaders plus
+     the uber shaders) and `post_shader_translate_tests` (FXAA, FSR 1, SMAA,
+     resample) translate every shader; on macOS each result is also
+     compiled by Metal. Only the two GX line/point geometry shaders have no
+     Metal equivalent.
+   - *GX core*: FIFO parsing, GX state, shader keys/generation and render
+     configuration build on POSIX (`galaxy_gx_core`) with their upstream
+     tests. SSE kernels run on AArch64 through sse2neon (vendored, MIT).
+
 ## Next steps
 
 7. **Renderer**: a Metal backend beside `renderer_d3d12.cpp` (~11k lines),
