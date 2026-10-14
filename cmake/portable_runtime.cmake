@@ -77,6 +77,38 @@ target_link_libraries(galaxy_runtime_timeline PUBLIC galaxy_runtime_abi galaxy_h
 add_library(galaxy_frame_telemetry STATIC runtime/src/frame_telemetry.cpp)
 target_link_libraries(galaxy_frame_telemetry PUBLIC galaxy_runtime_abi)
 
+# POSIX Win32 shims and the host (memory, disc, saves, audio, input).
+add_library(galaxy_win32_posix STATIC
+    runtime/src/win32_fs_posix.cpp
+    runtime/src/win32_host_posix.cpp)
+target_link_libraries(galaxy_win32_posix PUBLIC galaxy_runtime_abi Threads::Threads ${CMAKE_DL_LIBS})
+
+set(galaxy_native_host_sources
+    runtime/src/native_host.cpp
+    runtime/src/controller_hid.cpp
+    runtime/src/controller_hid_posix.cpp
+    runtime/src/flat_guest_memory_posix.cpp
+    runtime/src/gx/host_window_posix.cpp)
+set(galaxy_native_host_libraries
+    galaxy_runtime_abi galaxy_runtime_settings galaxy_native_input galaxy_native_dsp
+    galaxy_frame_cadence_diagnostics galaxy_ai_pcm_identity galaxy_win32_posix
+    galaxy_host_fiber)
+if(APPLE)
+    list(APPEND galaxy_native_host_libraries "-framework AudioToolbox" "-framework CoreAudio")
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        list(APPEND galaxy_native_host_libraries "-framework AudioUnit")
+    endif()
+endif()
+add_library(galaxy_native_host STATIC ${galaxy_native_host_sources})
+target_include_directories(galaxy_native_host PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src")
+target_link_libraries(galaxy_native_host PUBLIC ${galaxy_native_host_libraries})
+# Test-support variant, as on Windows (retired DSP mixer helpers, fault hooks).
+add_library(galaxy_native_host_test_support STATIC ${galaxy_native_host_sources})
+target_include_directories(galaxy_native_host_test_support PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src")
+target_link_libraries(galaxy_native_host_test_support PUBLIC ${galaxy_native_host_libraries})
+target_compile_definitions(galaxy_native_host_test_support PRIVATE
+    GALAXY_TEST_ALLOW_RETIRED_DSP_MIXER=1 GALAXY_NATIVE_HOST_TEST_SUPPORT=1)
+
 # The upstream unit tests that are portable, registered with CTest.
 # galaxy_portable_test(<name> SOURCES ... LIBS ... DEFS ...)
 function(galaxy_portable_test name)
@@ -123,6 +155,18 @@ galaxy_portable_test(runtime_timeline_tests LIBS galaxy_runtime_timeline)
 if(APPLE AND TARGET galaxy_runtime_timeline_tests)
     # std::jthread is still behind -fexperimental-library in Apple's libc++.
     target_compile_options(galaxy_runtime_timeline_tests PRIVATE -fexperimental-library)
+endif()
+galaxy_portable_test(win32_fs_posix_tests SOURCES runtime/src/win32_fs_posix_tests.cpp
+    LIBS galaxy_win32_posix)
+galaxy_portable_test(portable_hash_tests)
+galaxy_portable_test(native_host_tests
+    LIBS galaxy_native_host_test_support galaxy_host_pointer_events galaxy_native_input_causality)
+if(TARGET galaxy_native_host_tests)
+    # CI has no game-derived DSP ucode; the test-support build's retired mixer
+    # stands in for it, as upstream's test hook intends.
+    set_tests_properties(native_host_tests PROPERTIES
+        ENVIRONMENT "GALAXY_ALLOW_RETIRED_DSP_MIXER_FOR_TESTS=1"
+        TIMEOUT 1800)
 endif()
 galaxy_portable_test(native_dsp_tests LIBS galaxy_native_dsp galaxy_runtime_timeline)
 galaxy_portable_test(ppc_float_tests LIBS galaxy_ppc_float DEFS SOFTFLOAT_FAST_INT64=1)

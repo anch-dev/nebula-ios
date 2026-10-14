@@ -18,6 +18,7 @@
 #include "galaxy/runtime_settings.h"
 #include "galaxy/scope_exit.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
@@ -29,6 +30,15 @@
 #include <mmdeviceapi.h>
 #include <wrl/client.h>
 #include <xaudio2.h>
+#else
+// Linux/macOS/iOS: the Win32 file API through the POSIX shim, and the host
+// platform services (audio, controllers, window) through native_host_platform.h.
+#include "galaxy/platform_compat.h"
+#include "galaxy/win32_fs.h"
+#include "galaxy/win32_host_posix.h"
+#include "galaxy/windows_power.h"
+#include "galaxy/portable_hash.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -37,6 +47,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cmath>
 #include <cstdio>
@@ -64,13 +75,16 @@
 namespace galaxy::host {
 namespace {
 
+#if defined(_WIN32)
 using Microsoft::WRL::ComPtr;
+#endif
 
 struct HostHandleCloser {
     void operator()(HANDLE handle) const noexcept {
         if (handle != nullptr && handle != INVALID_HANDLE_VALUE) (void)CloseHandle(handle);
     }
 };
+#if defined(_WIN32)
 struct DeviceInfoListCloser {
     void operator()(HDEVINFO devices) const noexcept {
         if (devices != nullptr && devices != INVALID_HANDLE_VALUE) {
@@ -78,8 +92,9 @@ struct DeviceInfoListCloser {
         }
     }
 };
-using ScopedHostHandle = std::unique_ptr<void, HostHandleCloser>;
 using ScopedDeviceInfoList = std::unique_ptr<void, DeviceInfoListCloser>;
+#endif
+using ScopedHostHandle = std::unique_ptr<void, HostHandleCloser>;
 
 #if defined(GALAXY_NATIVE_HOST_TEST_SUPPORT)
 // Fault points are confined to the test-support build and its calling thread.
@@ -1742,6 +1757,7 @@ std::string win32_error_text(DWORD error) {
     return "win32 error " + std::to_string(error);
 }
 
+#if defined(_WIN32)
 struct OverlappedDrainResult {
     bool completed_successfully{};
     DWORD transferred{};
@@ -2137,6 +2153,20 @@ private:
     std::vector<std::uint8_t> input_buffer_;
     std::atomic_bool stop_requested_{false};
 };
+#else
+// Real Wii Remote passthrough reads Bluetooth HID through Windows; other
+// hosts report no remote, so the emulated remote stays in charge.
+class RealWiimoteHidBridge final : public input::NativeHidIoBackend {
+public:
+    void open() override {
+        throw std::runtime_error("real Wii Remote passthrough is only available on Windows");
+    }
+    bool poll_input(std::vector<std::byte>&) override { return false; }
+    bool write_output(std::span<const std::byte>) override { return false; }
+    void request_stop() noexcept override {}
+    void close() noexcept override {}
+};
+#endif
 
 bool trace_dsp_host() {
     static const bool enabled = read_env_flag("GALAXY_TRACE_DSP_HOST");
@@ -2344,6 +2374,7 @@ bool strict_audio_proof_enabled() {
     return enabled;
 }
 
+#if defined(_WIN32)
 class ScopedMmcssAudioThread {
 public:
     ScopedMmcssAudioThread() {
@@ -2419,6 +2450,7 @@ private:
     AvSetMmThreadPriorityFn av_set_priority_ = nullptr;
     AvRevertMmThreadCharacteristicsFn av_revert_ = nullptr;
 };
+#endif
 
 std::int64_t abs_i64(std::int64_t value) {
     return value < 0 ? -value : value;
@@ -3057,6 +3089,19 @@ void native_host_set_ownership_test_hook(NativeHostOwnershipTestHook hook) {
     s_host_ownership_test_hook = hook;
 }
 
+#if !defined(_WIN32)
+bool native_host_test_handle_cleanup() {
+    // The POSIX shim's handles are released by RAII owners the same way.
+    const HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (event == nullptr) return false;
+    try {
+        const ScopedHostHandle event_owner(event);
+        throw std::bad_alloc();
+    } catch (const std::bad_alloc&) {
+    }
+    return true;
+}
+#else
 bool native_host_test_handle_cleanup() {
     const HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     const HDEVINFO devices = SetupDiCreateDeviceInfoList(nullptr, nullptr);
@@ -3077,6 +3122,7 @@ bool native_host_test_handle_cleanup() {
     return GetHandleInformation(event, &flags) == FALSE &&
         SetupDiGetDeviceInfoListDetailW(devices, &detail) == FALSE;
 }
+#endif
 
 bool native_host_test_wav_dump(std::span<const std::byte> pcm,
     std::uint32_t rate, bool fail_finalization) {
@@ -3101,6 +3147,7 @@ bool native_host_test_concurrent_wav_dump() {
 }
 #endif
 
+#if defined(_WIN32)
 class NativeAudioSink final : public IXAudio2VoiceCallback,
                               public IXAudio2EngineCallback {
 public:
@@ -5943,6 +5990,9 @@ private:
     mutable std::mutex strict_failure_mutex_;
     std::array<char, 256> strict_failure_reason_{};
 };
+#else
+#include "native_audio_sink_posix.inl"
+#endif
 
 #if defined(GALAXY_NATIVE_HOST_TEST_SUPPORT)
 bool native_host_test_audio_recovery() {
@@ -10374,6 +10424,7 @@ std::vector<std::byte> read_binary_file(const std::filesystem::path& path) {
     return bytes;
 }
 
+#if defined(_WIN32)
 static std::string windows_hash_hex(
     std::span<const std::byte> bytes,
     LPCWSTR algorithm_name,
@@ -10449,6 +10500,15 @@ std::string sha1_hex(std::span<const std::byte> bytes) {
 static std::string sha256_hex(std::span<const std::byte> bytes) {
     return windows_hash_hex(bytes, BCRYPT_SHA256_ALGORITHM, "SHA-256");
 }
+#else
+std::string sha1_hex(std::span<const std::byte> bytes) {
+    return galaxy::hash::sha1_hex(bytes);
+}
+
+static std::string sha256_hex(std::span<const std::byte> bytes) {
+    return galaxy::hash::sha256_hex(bytes);
+}
+#endif
 
 BootImage read_boot_image(const std::filesystem::path& path) {
     BootImage image{};
@@ -21986,6 +22046,24 @@ std::optional<std::filesystem::path> extended_length_nand_root(
     std::filesystem::path absolute =
         std::filesystem::absolute(input, error).lexically_normal();
     if (error || !absolute.is_absolute()) return std::nullopt;
+#if !defined(_WIN32)
+    // POSIX has no extended-length prefix: an absolute path is the root, with
+    // room left under PATH_MAX for the longest path derived from it.
+    {
+        constexpr std::size_t kMaximumInternalMarkerChars = std::max({
+            kNandCandidateMarker.size(),
+            kNandDeleteMarker.size(),
+            kNandRenameBackupMarker.size(),
+            kNandRenameJournalMarker.size(),
+        });
+        constexpr std::size_t kMaximumDerivedPathChars =
+            (kIsfsPathBufferSize - 1u) + kMaximumInternalMarkerChars + 10u + 1u + 20u +
+            kNandMetadataPendingStream.size() + 1u;
+        const std::size_t length = absolute.native().size();
+        if (length == 0u || length + kMaximumDerivedPathChars >= PATH_MAX) return std::nullopt;
+        return absolute;
+    }
+#else
     absolute.make_preferred();
 
     const std::wstring native = absolute.native();
@@ -22046,6 +22124,7 @@ std::optional<std::filesystem::path> extended_length_nand_root(
     if (!is_drive_path(native, 0u)) return std::nullopt;
     return with_derived_path_headroom(std::filesystem::path(
         std::wstring(kExtendedPrefix) + native));
+#endif
 }
 
 struct IsfsPathResult {
@@ -22327,7 +22406,9 @@ std::string_view isfs_parent_path(std::string_view path) {
 std::filesystem::path nand_metadata_stream_path(
     const std::filesystem::path& host_path,
     std::wstring_view stream_name = kNandMetadataStream) {
-    std::wstring stream_path = host_path.native();
+    // wstring() on every platform: native() is narrow on POSIX, where the
+    // Win32 shim maps "file:stream" onto an extended attribute.
+    std::wstring stream_path = host_path.wstring();
     stream_path.append(stream_name);
     return std::filesystem::path(std::move(stream_path));
 }

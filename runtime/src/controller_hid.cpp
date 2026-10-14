@@ -1,3 +1,5 @@
+#if defined(_WIN32)
+// Non-Windows hosts: controller_hid_posix.cpp.
 #include "galaxy/controller_hid.h"
 #include "galaxy/content_viewport.h"
 #include "galaxy/rumble.h"
@@ -1163,3 +1165,5 @@ bool switch_controller_present_now() noexcept {
 }
 
 }  // namespace galaxy::host
+
+#endif  // _WIN32

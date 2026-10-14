@@ -6,9 +6,15 @@
 #include "galaxy/owned_storage_worker.h"
 #include "galaxy/runtime_settings.h"
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#else
+#include "galaxy/platform_compat.h"
+#include "galaxy/win32_fs.h"
+#include "galaxy/win32_host_posix.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -720,6 +726,56 @@ struct NativeBluetoothTestAccess {
 
 namespace {
 
+// NTFS named streams ("file:stream") are reachable through the C++ file
+// streams on Windows only; elsewhere the Win32 shim maps them onto extended
+// attributes, so stream paths go through the Win32 file API.
+bool is_named_stream_path(const std::filesystem::path& path) {
+#if defined(_WIN32)
+    (void)path;
+    return false;
+#else
+    return path.filename().string().find(':') != std::string::npos;
+#endif
+}
+
+std::vector<std::byte> read_any_file(const std::filesystem::path& path) {
+    if (!is_named_stream_path(path)) return galaxy::host::read_binary_file(path);
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("failed to open " + path.string());
+    }
+    std::vector<std::byte> bytes;
+    std::array<std::byte, 4096> chunk{};
+    for (;;) {
+        DWORD count = 0;
+        if (ReadFile(handle, chunk.data(), static_cast<DWORD>(chunk.size()), &count, nullptr) == FALSE) {
+            CloseHandle(handle);
+            throw std::runtime_error("failed to read " + path.string());
+        }
+        if (count == 0) break;
+        bytes.insert(bytes.end(), chunk.begin(), chunk.begin() + count);
+    }
+    CloseHandle(handle);
+    return bytes;
+}
+
+void write_stream_file(const std::filesystem::path& path, std::span<const std::byte> bytes) {
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, 0u, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("failed to create " + path.string());
+    }
+    DWORD written = 0;
+    const BOOL ok = WriteFile(handle, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+    const BOOL closed = CloseHandle(handle);
+    if (ok == FALSE || closed == FALSE || written != bytes.size()) {
+        throw std::runtime_error("failed to write " + path.string());
+    }
+}
+
+
 bool capture_native_keyboard_for_test() noexcept {
     return true;
 }
@@ -759,6 +815,10 @@ void write_le32(std::vector<std::byte>& bytes, std::size_t offset, std::uint32_t
 void write_binary_file(
     const std::filesystem::path& path,
     std::span<const std::byte> bytes) {
+    if (is_named_stream_path(path)) {
+        write_stream_file(path, bytes);
+        return;
+    }
     std::filesystem::create_directories(path.parent_path());
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (!file) {
@@ -780,8 +840,11 @@ std::filesystem::path extended_length_path_for_test(
     if (error || !absolute.is_absolute()) {
         throw std::runtime_error("failed to make absolute long test path");
     }
+#if !defined(_WIN32)
+    return absolute;  // POSIX has no extended-length form
+#endif
     absolute.make_preferred();
-    const std::wstring native = absolute.native();
+    const std::wstring native = absolute.wstring();
     if (native.starts_with(LR"(\\?\)")) return absolute;
     if (native.starts_with(LR"(\\)")) {
         return std::filesystem::path(
@@ -977,9 +1040,9 @@ bool exact_gis3_metadata_for_test(
     std::uint8_t other_mode,
     std::uint8_t attribute) {
     const std::filesystem::path metadata(
-        object.native() + L":galaxy.isfs.meta");
+        object.wstring() + L":galaxy.isfs.meta");
     return host_file_stream_exists_for_test(metadata) &&
-        galaxy::host::read_binary_file(metadata) ==
+        read_any_file(metadata) ==
             gis3_metadata_for_test(
                 owner,
                 group,
@@ -1044,6 +1107,10 @@ std::size_t nand_rename_transaction_artifact_count_for_test(
 }
 
 void write_text_file(const std::filesystem::path& path, const std::string& text) {
+    if (is_named_stream_path(path)) {
+        write_stream_file(path, std::as_bytes(std::span(text.data(), text.size())));
+        return;
+    }
     std::filesystem::create_directories(path.parent_path());
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (!file) {
@@ -1132,7 +1199,7 @@ public:
     ScopedWideEnv(const wchar_t* name, const std::filesystem::path& value)
         : name_(name) {
         save_old();
-        _wputenv_s(name_, value.c_str());
+        _wputenv_s(name_, value.wstring().c_str());
     }
 
     ~ScopedWideEnv() {
@@ -1604,8 +1671,10 @@ bool native_audio_recovery_backpressure_works(const std::filesystem::path& test_
         passed &= expect(
             galaxy::host::native_host_test_audio_recovery_backpressure(test_case),
             "device loss releases full-queue backpressure while preserving fatal failures and PCM ownership");
+#if defined(_WIN32)
+        // XAudio2 endpoint loss: the one unheard buffer reaches the WAV dump.
         if (test_case < 2u) {
-            const auto wav = galaxy::host::read_binary_file(path);
+            const auto wav = read_any_file(path);
             passed &= expect(wav.size() == 48u && wav[40] == std::byte{4} &&
                 std::equal(pcm.begin(), pcm.end(), wav.begin() + 44u),
                 "unheard PCM bypasses the blocked queue and is captured exactly once");
@@ -1613,6 +1682,9 @@ bool native_audio_recovery_backpressure_works(const std::filesystem::path& test_
             passed &= expect(!std::filesystem::exists(path),
                 "fatal producer failure cannot be reported as accepted unheard output");
         }
+#else
+        (void)pcm;  // no endpoint recovery outside XAudio2; the hook checks backpressure
+#endif
     }
     return passed;
 }
@@ -2348,14 +2420,14 @@ bool native_async_nand_ownership_works(const std::filesystem::path& shared_test_
             passed &= expect(audit.str().find(scenario == 3u ? "fatal-results=1" : "fatal-results=0") != std::string::npos &&
                 audit.str().find("shutdown-unreplied=1") != std::string::npos &&
                 memory.read_u32(kWrite) == 4u && latch.calls.load() == 1u &&
-                galaxy::host::read_binary_file(host_path) == payload,
+                read_any_file(host_path) == payload,
                 "shutdown drains physical persistence once and audits its unserved reply honestly");
             continue;
         }
         if (scenario == 2u || scenario == 4u) {
             passed &= expect_runtime_error([&] { memory.service_native_ios_completions(); },
                 "postcommit failure or held input mutation fails without unsafe replay");
-            passed &= expect(galaxy::host::read_binary_file(host_path) == payload,
+            passed &= expect(read_any_file(host_path) == payload,
                 "fatal after durable commit does not roll back or repeat the physical write");
             if (scenario == 2u) {
                 passed &= expect(memory.read_u32(kWrite) == 4u &&
@@ -2383,13 +2455,13 @@ bool native_async_nand_ownership_works(const std::filesystem::path& shared_test_
             passed &= expect_ios_reply(memory, guest, kWrite,
                 static_cast<std::uint32_t>(-111), 4u, "precommit replacement error produces exact IOS error");
             passed &= expect(Access::file_position(memory, fd) == 0u &&
-                Access::file_bytes(memory, fd).empty() && galaxy::host::read_binary_file(host_path).empty(),
+                Access::file_bytes(memory, fd).empty() && read_any_file(host_path).empty(),
                 "precommit failure preserves old disk bytes and live descriptor state");
         } else {
             passed &= expect_ios_reply(memory, guest, kWrite, 3u, 4u,
                 "durable first write is the first visible reply");
             passed &= expect(Access::file_bytes(memory, sibling) == payload &&
-                galaxy::host::read_binary_file(host_path) == payload,
+                read_any_file(host_path) == payload,
                 "durability commits the owned payload into shared backing before ordered followers");
         }
         acknowledge_ios_reply(guest);
@@ -2413,7 +2485,7 @@ bool native_async_nand_ownership_works(const std::filesystem::path& shared_test_
                 "second durable write receives exactly one reply");
             passed &= expect(Access::file_position(memory, fd) == 6u &&
                 Access::file_bytes(memory, sibling) == twice &&
-                galaxy::host::read_binary_file(host_path) == twice && latch.calls.load() == 2u,
+                read_any_file(host_path) == twice && latch.calls.load() == 2u,
                 "ordered writes persist each physical candidate once");
             acknowledge_ios_reply(guest);
         } else if (scenario == 6u) {
@@ -2532,13 +2604,13 @@ bool native_nand_atomic_persistence_works(
         const std::array<std::uint64_t, 2> provisional_identity =
             host_file_identity_for_test(host_path);
         const std::filesystem::path provisional_metadata_path(
-            host_path.native() + L":galaxy.isfs.meta");
+            host_path.wstring() + L":galaxy.isfs.meta");
         const std::filesystem::path provisional_marker_path(
-            host_path.native() + L":galaxy.isfs.provisional");
+            host_path.wstring() + L":galaxy.isfs.provisional");
         const std::vector<std::byte> provisional_metadata =
-            galaxy::host::read_binary_file(provisional_metadata_path);
+            read_any_file(provisional_metadata_path);
         const std::vector<std::byte> provisional_marker =
-            galaxy::host::read_binary_file(provisional_marker_path);
+            read_any_file(provisional_marker_path);
         writer.copy(
             kBuffer,
             std::span<const std::byte>(expected.data(), expected.size() - 1u));
@@ -2557,9 +2629,9 @@ bool native_nand_atomic_persistence_works(
         passed &= expect(
             host_file_identity_for_test(host_path) == provisional_identity &&
                 std::filesystem::file_size(host_path) == 0u &&
-                galaxy::host::read_binary_file(provisional_metadata_path) ==
+                read_any_file(provisional_metadata_path) ==
                     provisional_metadata &&
-                galaxy::host::read_binary_file(provisional_marker_path) ==
+                read_any_file(provisional_marker_path) ==
                     provisional_marker,
             "partial invalid GameData write preserves the exact empty object, GIS3, and GIP1 marker");
         // A replaced/tampered provisional marker must reject without losing
@@ -2568,9 +2640,7 @@ bool native_nand_atomic_persistence_works(
         auto tampered_marker = provisional_marker;
         tampered_marker.front() ^= std::byte{1u};
         {
-            std::ofstream marker(provisional_marker_path, std::ios::binary | std::ios::trunc);
-            marker.write(reinterpret_cast<const char*>(tampered_marker.data()),
-                static_cast<std::streamsize>(tampered_marker.size()));
+            write_binary_file(provisional_marker_path, tampered_marker);
         }
         writer.copy(kBuffer, expected);
         ios_write_request(writer, guest_memory, kRequest + 0xE0u,
@@ -2580,9 +2650,7 @@ bool native_nand_atomic_persistence_works(
             "provisional identity rejection returns access error and IOS acknowledgement credit");
         acknowledge_ios_reply(guest_memory);
         {
-            std::ofstream marker(provisional_marker_path, std::ios::binary | std::ios::trunc);
-            marker.write(reinterpret_cast<const char*>(provisional_marker.data()),
-                static_cast<std::streamsize>(provisional_marker.size()));
+            write_binary_file(provisional_marker_path, provisional_marker);
         }
         writer.copy(kBuffer, expected);
         ios_write_request(
@@ -2614,16 +2682,16 @@ bool native_nand_atomic_persistence_works(
     }
 
     const std::vector<std::byte> persisted =
-        galaxy::host::read_binary_file(host_path);
+        read_any_file(host_path);
     passed &= expect(
         persisted == expected,
         "disk GameData is exactly the complete 48,640-byte guest payload");
     const std::filesystem::path metadata_path(
-        host_path.native() + L":galaxy.isfs.meta");
+        host_path.wstring() + L":galaxy.isfs.meta");
     const std::filesystem::path provisional_path(
-        host_path.native() + L":galaxy.isfs.provisional");
+        host_path.wstring() + L":galaxy.isfs.provisional");
     const std::vector<std::byte> metadata =
-        galaxy::host::read_binary_file(metadata_path);
+        read_any_file(metadata_path);
     std::uint32_t metadata_checksum = 2'166'136'261u;
     if (metadata.size() >= 14u) {
         for (const std::byte value :
@@ -2759,7 +2827,7 @@ bool native_nand_atomic_persistence_works(
             "IOS_Close only releases state after a rejected synchronous write");
         acknowledge_ios_reply(guest_memory);
         passed &= expect(
-            galaxy::host::read_binary_file(host_path) == expected,
+            read_any_file(host_path) == expected,
             "failed write and close preserve the complete old GameData");
 
         if (locked_destination != INVALID_HANDLE_VALUE) {
@@ -2812,7 +2880,7 @@ bool native_nand_atomic_persistence_works(
         transaction_marker_count == 0u,
         "handled NAND persistence failures remove every GIS3 transaction marker");
     passed &= expect(
-        galaxy::host::read_binary_file(host_path) == expected,
+        read_any_file(host_path) == expected,
         "GameData remains exact after the injected synchronous persistence failure");
 
     std::filesystem::remove_all(isolated_root, cleanup_error);
@@ -3002,7 +3070,7 @@ bool native_nand_exact_current_surface_works(
             static_cast<std::uint32_t>(kPayload.size()));
         passed &= expect(
             memory.read_u32(kRequest + 0xC4u) == kPayload.size() &&
-                galaxy::host::read_binary_file(host_file) ==
+                read_any_file(host_file) ==
                     std::vector<std::byte>(kPayload.begin(), kPayload.end()),
             "mode 3 write publishes synchronously before IOS success");
         acknowledge_ios_reply(guest_memory);
@@ -3378,9 +3446,9 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
         }
         const std::vector<std::filesystem::path> seed_files =
             file_paths_for(seed_root);
-        fixture.sysconf = galaxy::host::read_binary_file(seed_files[1]);
-        fixture.setting = galaxy::host::read_binary_file(seed_files[2]);
-        fixture.play_rec = galaxy::host::read_binary_file(seed_files[3]);
+        fixture.sysconf = read_any_file(seed_files[1]);
+        fixture.setting = read_any_file(seed_files[2]);
+        fixture.play_rec = read_any_file(seed_files[3]);
     }
     std::filesystem::remove_all(seed_root, cleanup_error);
 
@@ -3413,7 +3481,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
         }
         for (const std::filesystem::path& file : files) {
             snapshot.file_bytes.push_back(
-                galaxy::host::read_binary_file(file));
+                read_any_file(file));
         }
         return snapshot;
     };
@@ -3434,7 +3502,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
             }
         }
         for (std::size_t index = 0u; index < files.size(); ++index) {
-            if (galaxy::host::read_binary_file(files[index]) !=
+            if (read_any_file(files[index]) !=
                 expected.file_bytes[index]) {
                 return false;
             }
@@ -3445,7 +3513,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
                                               const std::filesystem::path& root) {
         for (const std::filesystem::path& path : all_paths_for(root)) {
             const std::filesystem::path metadata(
-                path.native() + L":galaxy.isfs.meta");
+                path.wstring() + L":galaxy.isfs.meta");
             if (host_file_stream_exists_for_test(metadata)) return false;
         }
         return true;
@@ -3524,12 +3592,12 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
     };
     const auto metadata_stream_path = [](
                                           const std::filesystem::path& path) {
-        return std::filesystem::path(path.native() + L":galaxy.isfs.meta");
+        return std::filesystem::path(path.wstring() + L":galaxy.isfs.meta");
     };
     const auto pending_stream_path = [](
                                          const std::filesystem::path& path) {
         return std::filesystem::path(
-            path.native() + L":galaxy.isfs.meta.pending");
+            path.wstring() + L":galaxy.isfs.meta.pending");
     };
     const auto stamp_migration_prefix = [&](const std::filesystem::path& root,
                                             std::size_t count) {
@@ -3549,7 +3617,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
             if (host_named_stream_count_for_test(step.path) != 1u ||
                 !host_file_stream_exists_for_test(
                     metadata_stream_path(step.path)) ||
-                galaxy::host::read_binary_file(
+                read_any_file(
                     metadata_stream_path(step.path)) != step.metadata ||
                 host_file_stream_exists_for_test(
                     pending_stream_path(step.path))) {
@@ -3599,9 +3667,9 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
         const std::array<std::uint64_t, 2> first_boot_tmp_identity =
             host_file_identity_for_test(positive_root / L"tmp");
         const std::filesystem::path sysconf_metadata(
-            positive_files[1].native() + L":galaxy.isfs.meta");
+            positive_files[1].wstring() + L":galaxy.isfs.meta");
         const std::vector<std::byte> sysconf_gis3 =
-            galaxy::host::read_binary_file(sysconf_metadata);
+            read_any_file(sysconf_metadata);
         passed &= expect(
             cold_open_sysconf(),
             "a second cold startup accepts the fully migrated legacy cohort");
@@ -3610,14 +3678,14 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
                 host_file_identity_for_test(positive_root / L"tmp") !=
                     first_boot_tmp_identity &&
                 std::filesystem::is_empty(positive_root / L"tmp") &&
-                galaxy::host::read_binary_file(sysconf_metadata) == sysconf_gis3 &&
+                read_any_file(sysconf_metadata) == sysconf_gis3 &&
                 host_named_stream_count_for_test(positive_files[6]) == 0u &&
                 host_named_stream_count_for_test(positive_files[7]) == 0u &&
                 host_named_stream_count_for_test(positive_files[8]) == 0u,
             "second cold startup preserves persistent identity/bytes, resets tmp to a fresh empty object, and preserves sentinels");
 
         const std::filesystem::path stripped_metadata(
-            positive_files[2].native() + L":galaxy.isfs.meta");
+            positive_files[2].wstring() + L":galaxy.isfs.meta");
         passed &= expect(
             DeleteFileW(stripped_metadata.c_str()) != FALSE &&
                 !host_file_stream_exists_for_test(stripped_metadata),
@@ -3670,7 +3738,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
         const std::vector<std::filesystem::path> resume_files =
             file_paths_for(resume_root);
         const std::filesystem::path sysconf_metadata(
-            resume_files[1].native() + L":galaxy.isfs.meta");
+            resume_files[1].wstring() + L":galaxy.isfs.meta");
         const std::vector<std::byte> system_menu_gis3 =
             gis3_metadata_for_test(0x1000u, 1u, 3u, 3u, 3u, 0u);
         write_binary_file(sysconf_metadata, system_menu_gis3);
@@ -3682,7 +3750,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
         const LegacySnapshot before_resume = capture_snapshot(resume_root);
         passed &= expect(
             exact_partial_state &&
-                galaxy::host::read_binary_file(sysconf_metadata) ==
+                read_any_file(sysconf_metadata) ==
                     system_menu_gis3,
             "legacy crash-resume fixture has only durable System Menu SYSCONF authority");
         passed &= expect(
@@ -3692,7 +3760,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
         for (const std::filesystem::path& path :
              guest_visible_paths_for(resume_root)) {
             const std::filesystem::path metadata(
-                path.native() + L":galaxy.isfs.meta");
+                path.wstring() + L":galaxy.isfs.meta");
             metadata_complete &=
                 host_file_stream_exists_for_test(metadata) &&
                 host_named_stream_count_for_test(path) == 1u;
@@ -3719,9 +3787,9 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
         const std::vector<std::byte> system_menu_gis3 =
             gis3_metadata_for_test(0x1000u, 1u, 3u, 3u, 3u, 0u);
         const std::filesystem::path sysconf_metadata(
-            gap_files[1].native() + L":galaxy.isfs.meta");
+            gap_files[1].wstring() + L":galaxy.isfs.meta");
         const std::filesystem::path play_rec_metadata(
-            gap_files[3].native() + L":galaxy.isfs.meta");
+            gap_files[3].wstring() + L":galaxy.isfs.meta");
         write_binary_file(sysconf_metadata, system_menu_gis3);
         write_binary_file(play_rec_metadata, system_menu_gis3);
         const LegacySnapshot before_gap = capture_snapshot(resume_gap_root);
@@ -3738,9 +3806,9 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
         passed &= expect(
             snapshot_matches(resume_gap_root, before_gap) &&
                 only_original_streams &&
-                galaxy::host::read_binary_file(sysconf_metadata) ==
+                read_any_file(sysconf_metadata) ==
                     system_menu_gis3 &&
-                galaxy::host::read_binary_file(play_rec_metadata) ==
+                read_any_file(play_rec_metadata) ==
                     system_menu_gis3,
             "legacy resume-gap rejection preserves every object, byte, and original GIS3 without mutation");
     }
@@ -3761,7 +3829,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
         const LegacySnapshot before = capture_snapshot(torn_sys_root);
         passed &= expect(
             host_file_stream_exists_for_test(pending) &&
-                galaxy::host::read_binary_file(pending).empty(),
+                read_any_file(pending).empty(),
             "legacy SYS crash fixture carries an exact zero-byte pending GIS3 stream");
         passed &= expect(
             cold_open_sysconf(),
@@ -3879,17 +3947,17 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
         write_binary_file(final, sys_step.metadata);
         const LegacySnapshot before = capture_snapshot(ambiguous_root);
         const std::vector<std::byte> pending_before =
-            galaxy::host::read_binary_file(pending);
+            read_any_file(pending);
         const std::vector<std::byte> final_before =
-            galaxy::host::read_binary_file(final);
+            read_any_file(final);
         passed &= expect_runtime_error(
             [&] { static_cast<void>(cold_open_sysconf()); },
             "legacy startup hard-fails ambiguous invalid-pending plus valid-final GIS3");
         passed &= expect(
             snapshot_matches(ambiguous_root, before) &&
                 host_named_stream_count_for_test(sys_step.path) == 2u &&
-                galaxy::host::read_binary_file(pending) == pending_before &&
-                galaxy::host::read_binary_file(final) == final_before,
+                read_any_file(pending) == pending_before &&
+                read_any_file(final) == final_before,
             "ambiguous pending/final rejection preserves every object, byte, and raw ADS");
     }
     std::filesystem::remove_all(ambiguous_root, cleanup_error);
@@ -3911,7 +3979,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
                 sys_step.metadata.data(), 7u));
         const LegacySnapshot before = capture_snapshot(orphan_final_root);
         const std::vector<std::byte> final_before =
-            galaxy::host::read_binary_file(final);
+            read_any_file(final);
         passed &= expect_runtime_error(
             [&] { static_cast<void>(cold_open_sysconf()); },
             "legacy startup hard-fails a truncated final GIS3 without pending authority");
@@ -3920,7 +3988,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
                 host_named_stream_count_for_test(sys_step.path) == 1u &&
                 !host_file_stream_exists_for_test(
                     pending_stream_path(sys_step.path)) &&
-                galaxy::host::read_binary_file(final) == final_before,
+                read_any_file(final) == final_before,
             "orphan torn-final rejection preserves every object, byte, and raw final ADS");
     }
     std::filesystem::remove_all(orphan_final_root, cleanup_error);
@@ -3957,7 +4025,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
         const std::vector<std::filesystem::path> unknown_ads_files =
             file_paths_for(unknown_ads_root);
         const std::filesystem::path unknown_ads(
-            unknown_ads_files[4].native() + L":galaxy.unknown");
+            unknown_ads_files[4].wstring() + L":galaxy.unknown");
         constexpr std::array<std::byte, 4> kUnknownAdsBytes{
             std::byte{'N'}, std::byte{'O'}, std::byte{'P'}, std::byte{'E'}};
         write_binary_file(unknown_ads, kUnknownAdsBytes);
@@ -3978,7 +4046,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
         }
         passed &= expect(
             all_gis3_streams_absent(unknown_ads_root) && no_extra_streams &&
-                galaxy::host::read_binary_file(unknown_ads) ==
+                read_any_file(unknown_ads) ==
                     std::vector<std::byte>(
                         kUnknownAdsBytes.begin(), kUnknownAdsBytes.end()),
             "unknown-ADS rejection preserves the poison stream and publishes no GIS3 authority");
@@ -4014,7 +4082,7 @@ bool native_nand_pre_ads_legacy_cohort_startup_works(
             snapshot_matches(candidate_root, before_candidate) &&
                 recursive_relative_paths(candidate_root) == paths_before &&
                 host_file_identity_for_test(candidate) == candidate_identity &&
-                galaxy::host::read_binary_file(candidate) ==
+                read_any_file(candidate) ==
                     std::vector<std::byte>(
                         kCandidateBytes.begin(), kCandidateBytes.end()) &&
                 all_gis3_streams_absent(candidate_root) &&
@@ -4078,10 +4146,10 @@ bool native_nand_fresh_root_intent_recovery_works(
     };
     const auto root_pending_path = [](const std::filesystem::path& root) {
         return std::filesystem::path(
-            root.native() + L":galaxy.isfs.meta.pending");
+            root.wstring() + L":galaxy.isfs.meta.pending");
     };
     const auto root_final_path = [](const std::filesystem::path& root) {
-        return std::filesystem::path(root.native() + L":galaxy.isfs.meta");
+        return std::filesystem::path(root.wstring() + L":galaxy.isfs.meta");
     };
     const auto all_fresh_paths = [&](const std::filesystem::path& root) {
         std::vector<std::filesystem::path> paths{root};
@@ -4112,7 +4180,7 @@ bool native_nand_fresh_root_intent_recovery_works(
         for (const std::filesystem::path& path : snapshot.paths) {
             snapshot.identities.push_back(host_file_identity_for_test(path));
             snapshot.bytes.push_back(std::filesystem::is_regular_file(path)
-                ? galaxy::host::read_binary_file(path)
+                ? read_any_file(path)
                 : std::vector<std::byte>{});
         }
         return snapshot;
@@ -4125,7 +4193,7 @@ bool native_nand_fresh_root_intent_recovery_works(
                 return false;
             }
             if (!snapshot.bytes[index].empty() &&
-                galaxy::host::read_binary_file(snapshot.paths[index]) !=
+                read_any_file(snapshot.paths[index]) !=
                     snapshot.bytes[index]) {
                 return false;
             }
@@ -4143,7 +4211,7 @@ bool native_nand_fresh_root_intent_recovery_works(
                 return false;
             }
             if (!snapshot.bytes[index].empty() &&
-                galaxy::host::read_binary_file(snapshot.paths[index]) !=
+                read_any_file(snapshot.paths[index]) !=
                     snapshot.bytes[index]) {
                 return false;
             }
@@ -4187,7 +4255,7 @@ bool native_nand_fresh_root_intent_recovery_works(
             std::filesystem::is_empty(torn_empty_root) &&
                 host_file_stream_exists_for_test(
                     root_pending_path(torn_empty_root)) &&
-                galaxy::host::read_binary_file(
+                read_any_file(
                     root_pending_path(torn_empty_root)).empty(),
             "fresh-empty crash fixture contains only a zero-byte root pending GIS3");
         passed &= expect(
@@ -4198,9 +4266,9 @@ bool native_nand_fresh_root_intent_recovery_works(
         bool complete = paths.size() == kFreshMetadata.size();
         for (std::size_t index = 0u; index < paths.size(); ++index) {
             complete &= std::filesystem::exists(paths[index]) &&
-                galaxy::host::read_binary_file(
+                read_any_file(
                     std::filesystem::path(
-                        paths[index].native() + L":galaxy.isfs.meta")) ==
+                        paths[index].wstring() + L":galaxy.isfs.meta")) ==
                     metadata_bytes(index);
         }
         passed &= expect(
@@ -4226,9 +4294,9 @@ bool native_nand_fresh_root_intent_recovery_works(
         }
         const std::vector<std::filesystem::path> paths =
             all_fresh_paths(seed_root);
-        sysconf = galaxy::host::read_binary_file(paths[11]);
-        setting = galaxy::host::read_binary_file(paths[12]);
-        play_rec = galaxy::host::read_binary_file(paths[13]);
+        sysconf = read_any_file(paths[11]);
+        setting = read_any_file(paths[12]);
+        play_rec = read_any_file(paths[13]);
     }
     std::filesystem::remove_all(seed_root, cleanup_error);
 
@@ -4252,7 +4320,7 @@ bool native_nand_fresh_root_intent_recovery_works(
                 write_binary_file(path, bytes);
             }
             write_binary_file(
-                std::filesystem::path(path.native() + L":galaxy.isfs.meta"),
+                std::filesystem::path(path.wstring() + L":galaxy.isfs.meta"),
                 metadata_bytes(step + 1u));
         }
     };
@@ -4269,7 +4337,7 @@ bool native_nand_fresh_root_intent_recovery_works(
         passed &= expect(
             snapshot_matches(before) &&
                 !host_file_stream_exists_for_test(root_pending_path(resume_root)) &&
-                galaxy::host::read_binary_file(root_final_path(resume_root)) ==
+                read_any_file(root_final_path(resume_root)) ==
                     metadata_bytes(0u),
             "fresh prefix resume preserves every preexisting identity/byte and commits root final-only");
         const std::vector<std::filesystem::path> paths =
@@ -4277,9 +4345,9 @@ bool native_nand_fresh_root_intent_recovery_works(
         bool complete = paths.size() == kFreshMetadata.size();
         for (std::size_t index = 0u; index < paths.size(); ++index) {
             complete &= std::filesystem::exists(paths[index]) &&
-                galaxy::host::read_binary_file(
+                read_any_file(
                     std::filesystem::path(
-                        paths[index].native() + L":galaxy.isfs.meta")) ==
+                        paths[index].wstring() + L":galaxy.isfs.meta")) ==
                     metadata_bytes(index);
         }
         passed &= expect(
@@ -4314,7 +4382,7 @@ bool native_nand_fresh_root_intent_recovery_works(
                 std::filesystem::is_empty(torn_complete_root / L"tmp") &&
                 !host_file_stream_exists_for_test(
                     root_pending_path(torn_complete_root)) &&
-                galaxy::host::read_binary_file(final) == root_metadata,
+                read_any_file(final) == root_metadata,
             "fresh valid-pending/torn-final recovery preserves persistent identities/bytes, commits root, and resets tmp");
     }
     std::filesystem::remove_all(torn_complete_root, cleanup_error);
@@ -4327,17 +4395,17 @@ bool native_nand_fresh_root_intent_recovery_works(
         const std::filesystem::path later = gap_root / kFreshPaths[4];
         std::filesystem::create_directories(later);
         write_binary_file(
-            std::filesystem::path(later.native() + L":galaxy.isfs.meta"),
+            std::filesystem::path(later.wstring() + L":galaxy.isfs.meta"),
             metadata_bytes(5u));
         const FreshSnapshot before = capture_snapshot(gap_root);
         const std::vector<std::byte> pending_before =
-            galaxy::host::read_binary_file(root_pending_path(gap_root));
+            read_any_file(root_pending_path(gap_root));
         passed &= expect_runtime_error(
             [&] { static_cast<void>(cold_open_sysconf()); },
             "fresh root-pending startup hard-fails a deterministic-prefix gap");
         passed &= expect(
             snapshot_matches(before) &&
-                galaxy::host::read_binary_file(root_pending_path(gap_root)) ==
+                read_any_file(root_pending_path(gap_root)) ==
                     pending_before &&
                 !host_file_stream_exists_for_test(root_final_path(gap_root)),
             "fresh prefix-gap rejection performs no object, byte, or root-stream mutation");
@@ -4352,17 +4420,17 @@ bool native_nand_fresh_root_intent_recovery_works(
             L"GALAXY_NAND_ROOT", final_pending_root);
         const FreshSnapshot before = capture_snapshot(final_pending_root);
         const std::vector<std::byte> pending_before =
-            galaxy::host::read_binary_file(root_pending_path(final_pending_root));
+            read_any_file(root_pending_path(final_pending_root));
         const std::vector<std::byte> final_before =
-            galaxy::host::read_binary_file(root_final_path(final_pending_root));
+            read_any_file(root_final_path(final_pending_root));
         passed &= expect_runtime_error(
             [&] { static_cast<void>(cold_open_sysconf()); },
             "fresh startup hard-fails root pending+final with an incomplete core prefix");
         passed &= expect(
             snapshot_matches(before) &&
-                galaxy::host::read_binary_file(
+                read_any_file(
                     root_pending_path(final_pending_root)) == pending_before &&
-                galaxy::host::read_binary_file(
+                read_any_file(
                     root_final_path(final_pending_root)) == final_before,
             "incomplete root pending+final rejection preserves every object and intent stream");
     }
@@ -4381,20 +4449,20 @@ bool native_nand_fresh_root_intent_recovery_works(
             missing_modern_root / L"title" / L"00000001" / L"00000002" /
             L"data" / L"play_rec.dat";
         const std::filesystem::path missing_metadata(
-            missing.native() + L":galaxy.isfs.meta");
+            missing.wstring() + L":galaxy.isfs.meta");
         passed &= expect(
             DeleteFileW(missing.c_str()) != FALSE &&
                 !std::filesystem::exists(missing),
             "fresh strict-core fixture removes exactly one required modern child");
         const std::vector<std::byte> root_final =
-            galaxy::host::read_binary_file(root_final_path(missing_modern_root));
+            read_any_file(root_final_path(missing_modern_root));
         passed &= expect_runtime_error(
             [&] { static_cast<void>(cold_open_sysconf()); },
             "modern root-final startup hard-fails a missing required core child");
         passed &= expect(
             !std::filesystem::exists(missing) &&
                 !host_file_stream_exists_for_test(missing_metadata) &&
-                galaxy::host::read_binary_file(
+                read_any_file(
                     root_final_path(missing_modern_root)) == root_final,
             "modern missing-core rejection does not recreate the child or alter root authority");
     }
@@ -4440,7 +4508,7 @@ bool native_nand_invalid_sole_legacy_hard_fails(
         isolated_root / L"title" / L"00010000" / L"524d4745" / L"data" /
         L"GameData.bin";
     passed &= expect(
-        galaxy::host::read_binary_file(legacy) ==
+        read_any_file(legacy) ==
                 std::vector<std::byte>(
                     kInvalidLegacy.begin(), kInvalidLegacy.end()) &&
             !std::filesystem::exists(canonical),
@@ -4615,7 +4683,7 @@ bool native_nand_provisional_known_file_contract_works(
     const std::filesystem::path cold_canonical =
         canonical_path_for(cold_root);
     const std::filesystem::path cold_provisional_marker(
-        cold_canonical.native() + L":galaxy.isfs.provisional");
+        cold_canonical.wstring() + L":galaxy.isfs.provisional");
     constexpr std::string_view kUnrelatedPath =
         "/title/00010000/524d4745/data/keep.bin";
     const std::filesystem::path cold_unrelated =
@@ -4659,7 +4727,7 @@ bool native_nand_provisional_known_file_contract_works(
                 "cold-empty fixture publishes an exact provisional GameData");
             acknowledge_ios_reply(guest_memory);
             const std::vector<std::byte> provisional_marker =
-                galaxy::host::read_binary_file(cold_provisional_marker);
+                read_any_file(cold_provisional_marker);
             passed &= expect(
                 provisional_marker.size() == 24u &&
                     provisional_marker[0] == std::byte{'G'} &&
@@ -4741,7 +4809,7 @@ bool native_nand_provisional_known_file_contract_works(
             "cold recovery consumes the exact unfinished zero-byte GameData and returns ENOENT");
         passed &= expect(
             std::filesystem::is_regular_file(cold_unrelated) &&
-                galaxy::host::read_binary_file(cold_unrelated) ==
+                read_any_file(cold_unrelated) ==
                     std::vector<std::byte>(
                         kUnrelatedBytes.begin(), kUnrelatedBytes.end()),
             "cold provisional recovery preserves unrelated persistent NAND bytes");
@@ -4808,15 +4876,15 @@ bool native_nand_provisional_known_file_contract_works(
         const std::array<std::uint64_t, 2> original_identity =
             host_file_identity_for_test(canonical);
         const std::filesystem::path original_metadata(
-            canonical.native() + L":galaxy.isfs.meta");
+            canonical.wstring() + L":galaxy.isfs.meta");
         const std::filesystem::path replacement =
             canonical.parent_path() / L"GameData.bin.identity-replacement";
         const std::filesystem::path replacement_metadata(
-            replacement.native() + L":galaxy.isfs.meta");
+            replacement.wstring() + L":galaxy.isfs.meta");
         write_binary_file(replacement, std::span<const std::byte>{});
         write_binary_file(
             replacement_metadata,
-            galaxy::host::read_binary_file(original_metadata));
+            read_any_file(original_metadata));
         if (MoveFileExW(
                 replacement.c_str(),
                 canonical.c_str(),
@@ -4874,7 +4942,7 @@ bool native_nand_modern_startup_recovery_edges_work(
     const auto stream_path = [](
                                  const std::filesystem::path& path,
                                  std::wstring_view suffix) {
-        std::wstring native = path.native();
+        std::wstring native = path.wstring();
         native.append(suffix);
         return std::filesystem::path(std::move(native));
     };
@@ -4884,7 +4952,7 @@ bool native_nand_modern_startup_recovery_edges_work(
         const std::filesystem::path stream = stream_path(path, suffix);
         return host_file_stream_exists_for_test(stream)
             ? std::optional<std::vector<std::byte>>(
-                  galaxy::host::read_binary_file(stream))
+                  read_any_file(stream))
             : std::optional<std::vector<std::byte>>{};
     };
     const auto tree_paths = [](const std::filesystem::path& root) {
@@ -4917,7 +4985,7 @@ bool native_nand_modern_startup_recovery_edges_work(
             snapshot.directories.push_back(directory);
             snapshot.bytes.push_back(directory
                 ? std::vector<std::byte>{}
-                : galaxy::host::read_binary_file(path));
+                : read_any_file(path));
             std::array<std::optional<std::vector<std::byte>>, 3> streams;
             for (std::size_t index = 0u;
                  index < kStreamSuffixes.size();
@@ -4954,7 +5022,7 @@ bool native_nand_modern_startup_recovery_edges_work(
                 std::filesystem::is_directory(path) !=
                     snapshot.directories[index] ||
                 (!snapshot.directories[index] &&
-                 galaxy::host::read_binary_file(path) !=
+                 read_any_file(path) !=
                      snapshot.bytes[index])) {
                 return false;
             }
@@ -5063,8 +5131,8 @@ bool native_nand_modern_startup_recovery_edges_work(
                 host_file_identity_for_test(gip_root) == root_identity &&
                 host_file_identity_for_test(canonical) ==
                     canonical_identity &&
-                galaxy::host::read_binary_file(canonical) == game_data &&
-                galaxy::host::read_binary_file(
+                read_any_file(canonical) == game_data &&
+                read_any_file(
                     stream_path(canonical, kStreamSuffixes[0])) ==
                     rmge_file_metadata &&
                 host_file_identity_for_test(gip_root / L"tmp") !=
@@ -5368,8 +5436,8 @@ bool native_nand_rename_failure_atomicity_works(
                 canonical_identity_before_lock &&
             host_file_identity_for_test(good_source) ==
                 good_identity_before_lock &&
-            galaxy::host::read_binary_file(canonical) == valid_game_data &&
-            galaxy::host::read_binary_file(good_source) == valid_game_data,
+            read_any_file(canonical) == valid_game_data &&
+            read_any_file(good_source) == valid_game_data,
         "failed locked-target Rename preserves both exact file objects and bytes");
     passed &= expect(
         nand_rename_transaction_artifact_count_for_test(isolated_root) == 0u,
@@ -5394,12 +5462,12 @@ bool native_nand_rename_failure_atomicity_works(
         "valid Rename atomically replaces the existing canonical target");
     acknowledge_ios_reply(guest_memory);
     const std::filesystem::path canonical_provisional(
-        canonical.native() + L":galaxy.isfs.provisional");
+        canonical.wstring() + L":galaxy.isfs.provisional");
     passed &= expect(
         !std::filesystem::exists(good_source) &&
             host_file_identity_for_test(canonical) ==
                 good_identity_before_success &&
-            galaxy::host::read_binary_file(canonical) == valid_game_data &&
+            read_any_file(canonical) == valid_game_data &&
             !host_file_stream_exists_for_test(canonical_provisional) &&
             host_file_link_count_for_test(canonical) == 1u &&
             nand_rename_transaction_artifact_count_for_test(isolated_root) ==
@@ -5478,8 +5546,8 @@ bool native_nand_rename_failure_atomicity_works(
                 canonical_identity_before_policy &&
             host_file_identity_for_test(bad_source) ==
                 bad_identity_before_policy &&
-            galaxy::host::read_binary_file(canonical) == valid_game_data &&
-            galaxy::host::read_binary_file(bad_source) ==
+            read_any_file(canonical) == valid_game_data &&
+            read_any_file(bad_source) ==
                 std::vector<std::byte>(
                     kMalformedGameData.begin(), kMalformedGameData.end()),
         "target-policy rejection preserves both source and canonical target before mutation");
@@ -5533,13 +5601,13 @@ bool native_nand_rename_journal_cold_recovery_works(
     };
     const auto backup_path_for = [&](const std::filesystem::path& root) {
         const std::filesystem::path target = target_path_for(root);
-        std::wstring backup_name = target.native();
+        std::wstring backup_name = target.wstring();
         backup_name.append(kBackupSuffix.data(), kBackupSuffix.size());
         return std::filesystem::path(std::move(backup_name));
     };
     const auto journal_path_for = [&](const std::filesystem::path& root) {
         const std::filesystem::path target = target_path_for(root);
-        std::wstring journal_name = target.native();
+        std::wstring journal_name = target.wstring();
         journal_name.append(kJournalSuffix.data(), kJournalSuffix.size());
         return std::filesystem::path(std::move(journal_name));
     };
@@ -5701,7 +5769,7 @@ bool native_nand_rename_journal_cold_recovery_works(
                 host_file_link_count_for_test(target) == 2u &&
                 host_file_link_count_for_test(backup) == 2u &&
                 host_file_link_count_for_test(journal) == 1u &&
-                galaxy::host::read_binary_file(journal) == journal_bytes,
+                read_any_file(journal) == journal_bytes,
             "precommit GIR1 fixture binds the source and two-link old target to paired journal names");
         passed &= expect(
             cold_open_target(precommit_root),
@@ -5711,7 +5779,7 @@ bool native_nand_rename_journal_cold_recovery_works(
                 !std::filesystem::exists(journal) &&
                 host_file_identity_for_test(target) == old_identity &&
                 host_file_link_count_for_test(target) == 1u &&
-                galaxy::host::read_binary_file(target) ==
+                read_any_file(target) ==
                     std::vector<std::byte>(kOldBytes.begin(), kOldBytes.end()) &&
                 nand_rename_transaction_artifact_count_for_test(
                     precommit_root) == 0u,
@@ -5761,7 +5829,7 @@ bool native_nand_rename_journal_cold_recovery_works(
                 host_file_link_count_for_test(backup) == 1u &&
                 host_file_link_count_for_test(target) == 1u &&
                 host_file_link_count_for_test(journal) == 1u &&
-                galaxy::host::read_binary_file(journal) == journal_bytes,
+                read_any_file(journal) == journal_bytes,
             "postcommit GIR1 fixture has distinct one-link backup and committed destination objects");
         passed &= expect(
             cold_open_target(postcommit_root),
@@ -5771,7 +5839,7 @@ bool native_nand_rename_journal_cold_recovery_works(
                 !std::filesystem::exists(journal) &&
                 host_file_identity_for_test(target) == new_identity &&
                 host_file_link_count_for_test(target) == 1u &&
-                galaxy::host::read_binary_file(target) ==
+                read_any_file(target) ==
                     std::vector<std::byte>(kNewBytes.begin(), kNewBytes.end()) &&
                 nand_rename_transaction_artifact_count_for_test(
                     postcommit_root) == 0u,
@@ -5823,9 +5891,9 @@ bool native_nand_rename_journal_cold_recovery_works(
                 host_file_identity_for_test(target) == old_identity &&
                 host_file_link_count_for_test(source) == 1u &&
                 host_file_link_count_for_test(target) == 1u &&
-                galaxy::host::read_binary_file(source) ==
+                read_any_file(source) ==
                     std::vector<std::byte>(kNewBytes.begin(), kNewBytes.end()) &&
-                galaxy::host::read_binary_file(target) ==
+                read_any_file(target) ==
                     std::vector<std::byte>(kOldBytes.begin(), kOldBytes.end()) &&
                 nand_rename_transaction_artifact_count_for_test(
                     journal_only_precommit_root) == 0u,
@@ -5884,7 +5952,7 @@ bool native_nand_rename_journal_cold_recovery_works(
                 !std::filesystem::exists(journal) &&
                 host_file_identity_for_test(target) == new_identity &&
                 host_file_link_count_for_test(target) == 1u &&
-                galaxy::host::read_binary_file(target) ==
+                read_any_file(target) ==
                     std::vector<std::byte>(kNewBytes.begin(), kNewBytes.end()) &&
                 nand_rename_transaction_artifact_count_for_test(
                     journal_only_postcommit_root) == 0u,
@@ -5934,11 +6002,11 @@ bool native_nand_rename_journal_cold_recovery_works(
                 host_file_link_count_for_test(source) == 1u &&
                 host_file_link_count_for_test(target) == 1u &&
                 host_file_link_count_for_test(journal) == 1u &&
-                galaxy::host::read_binary_file(source) ==
+                read_any_file(source) ==
                     std::vector<std::byte>(kNewBytes.begin(), kNewBytes.end()) &&
-                galaxy::host::read_binary_file(target) ==
+                read_any_file(target) ==
                     std::vector<std::byte>(kOldBytes.begin(), kOldBytes.end()) &&
-                galaxy::host::read_binary_file(journal) == journal_bytes &&
+                read_any_file(journal) == journal_bytes &&
                 nand_rename_transaction_artifact_count_for_test(
                     wrong_identity_root) == 1u,
             "wrong-source GIR1 rejection performs no mutation and preserves forensic journal bytes");
@@ -5983,7 +6051,7 @@ bool native_nand_rename_journal_cold_recovery_works(
                 host_file_identity_for_test(backup) == old_identity &&
                 host_file_link_count_for_test(backup) == 1u &&
                 host_file_link_count_for_test(journal) == 1u &&
-                galaxy::host::read_binary_file(journal) == journal_bytes,
+                read_any_file(journal) == journal_bytes,
             "rollback GIR1 fixture binds the live source and backup-only old target");
         passed &= expect(
             cold_open_target(backup_only_root),
@@ -5993,7 +6061,7 @@ bool native_nand_rename_journal_cold_recovery_works(
                 !std::filesystem::exists(journal) &&
                 host_file_identity_for_test(target) == old_identity &&
                 host_file_link_count_for_test(target) == 1u &&
-                galaxy::host::read_binary_file(target) ==
+                read_any_file(target) ==
                     std::vector<std::byte>(kOldBytes.begin(), kOldBytes.end()) &&
                 nand_rename_transaction_artifact_count_for_test(
                     backup_only_root) == 0u,
@@ -6094,20 +6162,20 @@ bool native_nand_rename_journal_cold_recovery_works(
         const std::filesystem::path source =
             provisional_root / L"title" / L"00010000" / L"524d4745" /
             L"data" / L"prov" / L"GameData.bin";
-        std::wstring backup_name = target.native();
+        std::wstring backup_name = target.wstring();
         backup_name.append(kBackupSuffix.data(), kBackupSuffix.size());
         const std::filesystem::path backup(std::move(backup_name));
-        std::wstring journal_name = target.native();
+        std::wstring journal_name = target.wstring();
         journal_name.append(kJournalSuffix.data(), kJournalSuffix.size());
         const std::filesystem::path journal(std::move(journal_name));
         const std::filesystem::path target_marker(
-            target.native() + L":galaxy.isfs.provisional");
+            target.wstring() + L":galaxy.isfs.provisional");
         const std::array<std::uint64_t, 2> old_identity =
             host_file_identity_for_test(target);
         const std::array<std::uint64_t, 2> new_identity =
             host_file_identity_for_test(source);
         const std::vector<std::byte> provisional_marker =
-            galaxy::host::read_binary_file(target_marker);
+            read_any_file(target_marker);
         const std::vector<std::byte> journal_bytes =
             gir1_rename_journal_for_test(
                 kProvisionalSourcePath,
@@ -6127,18 +6195,18 @@ bool native_nand_rename_journal_cold_recovery_works(
         }
         write_binary_file(journal, journal_bytes);
         const std::filesystem::path backup_marker(
-            backup.native() + L":galaxy.isfs.provisional");
+            backup.wstring() + L":galaxy.isfs.provisional");
         passed &= expect(
             !std::filesystem::exists(source) &&
                 host_file_identity_for_test(target) == new_identity &&
                 host_file_identity_for_test(backup) == old_identity &&
                 host_file_link_count_for_test(target) == 1u &&
                 host_file_link_count_for_test(backup) == 1u &&
-                galaxy::host::read_binary_file(backup).empty() &&
-                galaxy::host::read_binary_file(backup_marker) ==
+                read_any_file(backup).empty() &&
+                read_any_file(backup_marker) ==
                     provisional_marker &&
                 !host_file_stream_exists_for_test(target_marker) &&
-                galaxy::host::read_binary_file(journal) == journal_bytes,
+                read_any_file(journal) == journal_bytes,
             "GIR1 provisional flag binds the postcommit backup to the exact empty GIP1 object");
         creator_owner.reset();
         passed &= expect(
@@ -6150,7 +6218,7 @@ bool native_nand_rename_journal_cold_recovery_works(
                 !std::filesystem::exists(journal) &&
                 host_file_identity_for_test(target) == new_identity &&
                 host_file_link_count_for_test(target) == 1u &&
-                galaxy::host::read_binary_file(target) == valid_game_data &&
+                read_any_file(target) == valid_game_data &&
                 !host_file_stream_exists_for_test(target_marker) &&
                 nand_rename_transaction_artifact_count_for_test(
                     provisional_root) == 0u,
@@ -6207,9 +6275,9 @@ bool native_nand_extended_length_rename_recovery_works(
     cleanup_error.clear();
 
     constexpr std::size_t kDesiredRootLength = 204u;
-    const std::size_t padding_length = anchor.native().size() + 1u <
+    const std::size_t padding_length = anchor.wstring().size() + 1u <
             kDesiredRootLength
-        ? kDesiredRootLength - anchor.native().size() - 1u
+        ? kDesiredRootLength - anchor.wstring().size() - 1u
         : 8u;
     if (padding_length == 0u || padding_length > 240u) {
         return expect(false, "long-path regression has a valid padding component");
@@ -6289,23 +6357,23 @@ bool native_nand_extended_length_rename_recovery_works(
             galaxy::host::NativeNandTestAccess::nand_host_path(
                 creator, kDeepestGuestPath);
         journal = std::filesystem::path(
-            target.native() +
+            target.wstring() +
             std::wstring(kJournalSuffix.data(), kJournalSuffix.size()));
         const std::filesystem::path target_metadata(
-            target.native() + L":galaxy.isfs.meta");
+            target.wstring() + L":galaxy.isfs.meta");
         const std::filesystem::path target_pending(
-            target.native() + L":galaxy.isfs.meta.pending");
+            target.wstring() + L":galaxy.isfs.meta.pending");
         const std::filesystem::path candidate_pending(
-            target.native() +
+            target.wstring() +
             L".__galaxy_isfs_candidate__.1.1:galaxy.isfs.meta.pending");
         passed &= expect(
             runtime_root == extended_length_path_for_test(isolated_root) &&
-                deepest_host.native().size() > MAX_PATH &&
-                target.native().size() < MAX_PATH &&
-                target_metadata.native().size() > MAX_PATH &&
-                target_pending.native().size() > MAX_PATH &&
-                candidate_pending.native().size() > MAX_PATH &&
-                journal.native().size() > MAX_PATH,
+                deepest_host.wstring().size() > MAX_PATH &&
+                target.wstring().size() < MAX_PATH &&
+                target_metadata.wstring().size() > MAX_PATH &&
+                target_pending.wstring().size() > MAX_PATH &&
+                candidate_pending.wstring().size() > MAX_PATH &&
+                journal.wstring().size() > MAX_PATH,
             "long-path regression maps the 63-byte guest bound and crosses MAX_PATH only in ADS/candidate/journal suffixes");
 
         const std::uint32_t fs_handle = ios_open_path(
@@ -6364,7 +6432,7 @@ bool native_nand_extended_length_rename_recovery_works(
         acknowledge_ios_reply(guest_memory);
         passed &= expect(
             !std::filesystem::exists(source) &&
-                galaxy::host::read_binary_file(target) ==
+                read_any_file(target) ==
                     std::vector<std::byte>(
                         kNewBytes.begin(), kNewBytes.end()) &&
                 nand_rename_transaction_artifact_count_for_test(runtime_root) ==
@@ -6393,7 +6461,7 @@ bool native_nand_extended_length_rename_recovery_works(
         passed &= expect(
             nand_rename_transaction_artifact_count_for_test(runtime_root) ==
                     1u &&
-                galaxy::host::read_binary_file(journal) == journal_bytes,
+                read_any_file(journal) == journal_bytes,
             "long-path recovery fixture persists a GIR1 journal beyond MAX_PATH");
         ios_close_request(
             creator, guest_memory, kRequest + 0x180u, fs_handle);
@@ -6433,10 +6501,10 @@ bool native_nand_extended_length_rename_recovery_works(
             !std::filesystem::exists(journal) &&
                 host_file_identity_for_test(source) == source_identity &&
                 host_file_identity_for_test(target) == target_identity &&
-                galaxy::host::read_binary_file(source) ==
+                read_any_file(source) ==
                     std::vector<std::byte>(
                         kOldBytes.begin(), kOldBytes.end()) &&
-                galaxy::host::read_binary_file(target) ==
+                read_any_file(target) ==
                     std::vector<std::byte>(
                         kNewBytes.begin(), kNewBytes.end()) &&
                 nand_rename_transaction_artifact_count_for_test(runtime_root) ==
@@ -6448,6 +6516,8 @@ bool native_nand_extended_length_rename_recovery_works(
         !cleanup_error && !std::filesystem::exists(extended_anchor),
         "long-path regression removes its isolated extended-length test tree");
 
+#if defined(_WIN32)
+    // Windows device and volume namespaces (POSIX has no such path forms).
     constexpr std::array<std::wstring_view, 4> kRejectedNamespaces{
         LR"(\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\galaxy-nand)",
         LR"(\\?\Volume{00000000-0000-0000-0000-000000000000}\galaxy-nand)",
@@ -6466,6 +6536,7 @@ bool native_nand_extended_length_rename_recovery_works(
             },
             "native NAND rejects non-file extended device namespaces before mutation");
     }
+#endif
     return passed;
 }
 
@@ -6709,7 +6780,7 @@ bool native_nand_fresh_rfl_safe_replace_works(
             passed &= expect(
                 memory.read_u32(kRequest + 0x1C4u) ==
                         static_cast<std::uint32_t>(valid_rfl.size()) &&
-                    galaxy::host::read_binary_file(host_temp_rfl) == valid_rfl,
+                    read_any_file(host_temp_rfl) == valid_rfl,
                 "safe-open temp receives the complete CRC-valid generated empty RFL before success");
             acknowledge_ios_reply(guest_memory);
             passed &= expect(
@@ -6735,7 +6806,7 @@ bool native_nand_fresh_rfl_safe_replace_works(
             passed &= expect(
                 memory.read_u32(kRequest + 0x244u) == 0u &&
                     !std::filesystem::exists(host_temp_rfl) &&
-                    galaxy::host::read_binary_file(host_rfl) == valid_rfl &&
+                    read_any_file(host_rfl) == valid_rfl &&
                     !galaxy::host::NativeNandTestAccess::
                         provisional_nand_file_tracked(memory, kRflPath),
                 "safe-close Rename replaces the empty target with the validated same-name object and consumes provisional authority");
@@ -14409,6 +14480,8 @@ int main(int argc, char** argv) {
     // environment before exercising the fresh synthetic KPAD read fixture.
     passed &= synthetic_kpad_pointer_read_owns_press_coordinates_and_fresh_geometry();
 
+#if defined(GALAXY_HAVE_NATIVE_DSP)
+    // Only a build with the generated DSP ucode can boot the native DSP.
     {
         ScopedEnv enable_native_dsp("GALAXY_DSP_NATIVE", "1");
         {
@@ -14434,6 +14507,7 @@ int main(int argc, char** argv) {
                 "requested native DSP must hard-fail instead of faking boot without an IRAM descriptor");
         }
     }
+#endif
     ScopedEnv disable_native_bt_for_legacy_tests(
         "GALAXY_NATIVE_BT_WIIMOTE", "0");
     ScopedEnv allow_retired_dsp_mixer_for_legacy_tests(
@@ -19267,9 +19341,17 @@ int main(int argc, char** argv) {
             "unsupported disc mod main.dol SHA-1 hard-fails");
     }
     const auto rooted_manifest_path = mod_test_root / "rooted_disc_overrides.tsv";
-    for (const std::string& rooted_path : std::array<std::string, 4>{
+#if defined(_WIN32)
+    const std::array<std::string, 4> rooted_paths{
             R"(\outside.bin)", "D:outside.bin", R"(\\server\share\outside.bin)",
-            mod_test_root.root_name().string() + "mods/airship_patch.bin"}) {
+            mod_test_root.root_name().string() + "mods/airship_patch.bin"};
+#else
+    // The POSIX ways out of the manifest directory.
+    const std::array<std::string, 4> rooted_paths{
+            "/outside.bin", "../outside.bin", "mods/../../outside.bin",
+            (mod_test_root / "mods" / "airship_patch.bin").string()};
+#endif
+    for (const std::string& rooted_path : rooted_paths) {
         write_text_file(rooted_manifest_path,
             "version 1\ngame RMGE01\nmain_dol_sha1 " +
             std::string(kRmge01DolSha1) + "\n0x40 0x10 " + rooted_path + "\n");

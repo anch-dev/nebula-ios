@@ -140,4 +140,36 @@ inline std::uint64_t _udiv128(std::uint64_t high, std::uint64_t low,
     return static_cast<std::uint64_t>(dividend / divisor);
 }
 
+// MSVC bounded string functions.
+using errno_t = int;
+inline std::size_t strnlen_s(const char* text, std::size_t maximum) noexcept {
+    return text == nullptr ? 0u : ::strnlen(text, maximum);
+}
+#ifndef _TRUNCATE
+#define _TRUNCATE (static_cast<std::size_t>(-1))
+#endif
+// strncpy_s(dest, size, src, count): copies at most `count` characters (all
+// that fit, with _TRUNCATE) and always terminates; STRUNCATE (80) when cut.
+inline errno_t strncpy_s(char* destination, std::size_t size, const char* source,
+                         std::size_t count) noexcept {
+    if (destination == nullptr || size == 0u) return EINVAL;
+    if (source == nullptr) {
+        destination[0] = '\0';
+        return EINVAL;
+    }
+    const std::size_t available = ::strnlen(source, count == _TRUNCATE ? size : count);
+    if (available >= size) {
+        if (count != _TRUNCATE) {
+            destination[0] = '\0';
+            return ERANGE;
+        }
+        std::memcpy(destination, source, size - 1u);
+        destination[size - 1u] = '\0';
+        return 80;  // STRUNCATE
+    }
+    std::memcpy(destination, source, available);
+    destination[available] = '\0';
+    return 0;
+}
+
 #endif
