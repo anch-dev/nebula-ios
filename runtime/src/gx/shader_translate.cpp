@@ -91,11 +91,11 @@ std::vector<IoVariable> io_variables(
         variables.push_back(std::move(variable));
     }
     for (IoVariable& variable : variables) {
-        const char last = variable.semantic.back();
-        if (std::isdigit(static_cast<unsigned char>(last))) continue;
+        // Element i of an array declared at SEMANTICn has SEMANTIC(n + i);
+        // a plain "COLOR" on a single variable is COLOR0.
         const std::uint32_t element = variable.location - first_location[variable.semantic];
-        // A plain "COLOR" on a single variable is COLOR0.
-        variable.semantic += std::to_string(element);
+        const auto [base, index] = split_semantic(variable.semantic);
+        variable.semantic = base + std::to_string(index + element);
     }
     return variables;
 }
@@ -201,10 +201,17 @@ Result hlsl_to_msl(std::string_view hlsl, Stage stage, const Options& options) {
         if (stage != Stage::Compute) {
             const auto& interstage =
                 stage == Stage::Vertex ? resources.stage_outputs : resources.stage_inputs;
+            std::map<std::uint32_t, std::string> used;
             for (const IoVariable& value : io_variables(msl, interstage)) {
                 if (split_semantic(value.semantic).first.rfind("SV_", 0) == 0) continue;
-                msl.set_decoration(value.id, spv::DecorationLocation,
-                                   interstage_location(value.semantic));
+                const std::uint32_t location = interstage_location(value.semantic);
+                const auto [it, inserted] = used.emplace(location, value.semantic);
+                if (!inserted) {
+                    result.log = "interstage semantics " + it->second + " and " +
+                                 value.semantic + " share location " + std::to_string(location);
+                    return result;
+                }
+                msl.set_decoration(value.id, spv::DecorationLocation, location);
             }
         }
         if (stage == Stage::Pixel && options.dual_source_blend) {
