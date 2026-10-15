@@ -14,7 +14,7 @@ must keep building unchanged.
   iOS. No Mac is needed.
 - **Game code never goes to GitHub.** The runtime/app shell is built in CI;
   the game modules are generated and compiled on the user's own PC from their
-  own copy, then added to the app before sideloading. (Planned; see step 8.)
+  own copy, then added to the app before sideloading (step 8, [IOS.md](IOS.md)).
 
 On a non-Windows host the top-level `CMakeLists.txt` includes
 `cmake/portable_runtime.cmake`, which builds only what has been ported.
@@ -152,14 +152,38 @@ timeline race test can time out under heavy QEMU load only).
      renderer).
    `GALAXY_D3D12_BACKEND=cpu` forces the CPU backend.
 
+8. **Game module pipeline** (`tools/ios/`, guide in [IOS.md](IOS.md)): the
+   game, Home Menu and DSP modules are compiled on the user's Windows PC
+   from their own game, with stock LLVM (clang++ and ld64.lld), and added to
+   the IPA before SideStore/AltStore signs it.
+   - `package-module-sdk.sh` (CI, macOS) packages the module SDK: runtime
+     headers, the runtime's iOS static libraries the modules link, and the
+     iOS SDK headers and `.tbd` link stubs those need (taken from the
+     runner's Xcode; Apple's SDK terms apply to them).
+   - `build-modules.ps1` runs nebula-recomp (identify, extract,
+     package-content, generate), compiles with the Windows build's flags
+     (`-fno-rtti -w -ffp-contract=off -fwrapv -fno-strict-aliasing`, a PCH
+     for `functions.h`, `-O0` for the Home Menu as upstream), links each
+     module as `Frameworks/<name>.framework` and adds them and the boot image
+     to the IPA.
+   - The runtime looks for modules in `<bundle>/Frameworks/` on Apple hosts
+     (`native_module_path.h`), and the POSIX product build loads the DSP
+     from `RMGE01_dsp` as the Windows product does.
+   - CI checks the SDK with Homebrew LLVM on macOS and runs the script on
+     Windows over a test tree that includes real recompiler output for
+     public synthetic code; `nebula-ios-pc-kit` (recompiler, script, SDK)
+     is an artifact.
+
 ## Next steps
 
-8. **Game module pipeline**: generated C++ → arm64 dylib(s) built on the
-   user's PC (stock clang + lld, `-target arm64-apple-ios`), injected into the
-   IPA before sideloading. Needs a header set that does not depend on the iOS
-   SDK; to be verified.
-9. **iOS app shell**: Xcode/CMake project, CAMetalLayer view, touch controls,
-   gyro pointer; built unsigned in CI.
+9. **iOS app shell** (`apple/ios/`, first cut): a UIKit app around
+   `galaxy_runtime_main` with the product environment
+   (`installer/runtime-env.json`), content and saves in Documents (Files
+   app), the CAMetalLayer view, touch controls (an Xbox-layout pad plus the
+   touch pointer), GCController gamepads and a hardware keyboard. CI
+   packages `Nebula.ipa` (ad-hoc signed with the entitlements).
+   Still to do: controller rumble, gyro pointer, pausing in the background,
+   an app icon, and testing on a device.
 
 ## Risks
 
