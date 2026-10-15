@@ -63,7 +63,10 @@ rm -f "$deps" "$deps.d"
 # Link stubs (text). libSystem re-exports usr/lib/system/*.
 cp -L "$sdk/usr/lib/libSystem.tbd" "$sdk/usr/lib/libc++.tbd" "$out/sysroot/usr/lib/"
 [ -f "$sdk/usr/lib/libc++abi.tbd" ] && cp -L "$sdk/usr/lib/libc++abi.tbd" "$out/sysroot/usr/lib/"
-cp -L "$sdk"/usr/lib/system/*.tbd "$out/sysroot/usr/lib/system/"
+# (Older SDKs keep libSystem's parts in separate stubs; newer ones inline them.)
+for stub in "$sdk"/usr/lib/system/*.tbd; do
+    [ -e "$stub" ] && cp -L "$stub" "$out/sysroot/usr/lib/system/"
+done
 cp "$sdk/SDKSettings.json" "$out/sysroot/" 2>/dev/null || true
 
 cat > "$out/README.txt" <<EOF
