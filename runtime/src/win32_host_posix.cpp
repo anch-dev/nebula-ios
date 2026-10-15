@@ -5,8 +5,13 @@
 #if !defined(_WIN32)
 
 #include "galaxy/win32_host_posix.h"
+#include "galaxy/win32_gui_posix.h"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <memory>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -35,8 +40,26 @@ namespace {
 int g_window_identity = 0;
 HWND window_handle() noexcept { return &g_window_identity; }
 
+// One thread's message queue (GetMessageW/PeekMessageW).
+struct SentMessage;
+struct ThreadQueue {
+    std::deque<MSG> messages;
+    std::condition_variable changed;
+};
+
+// A message sent to the window from another thread (SendMessageTimeoutW),
+// run by the window thread's next GetMessageW/PeekMessageW.
+struct SentMessage {
+    UINT message = 0;
+    WPARAM wparam = 0;
+    LPARAM lparam = 0;
+    LRESULT result = 0;
+    bool done = false;
+};
+
 struct HostState {
     std::mutex mutex;
+    // The app shell's view.
     void* view = nullptr;
     int width = 0;
     int height = 0;
@@ -48,11 +71,35 @@ struct HostState {
     std::array<galaxy::host_platform::PadState, 4> pads{};
     std::array<DWORD, 4> packets{};
     std::array<galaxy::host_platform::PadRumble, 4> rumble{};
+    // The screen (monitor).
+    int screen_width = 0;
+    int screen_height = 0;
+    unsigned refresh_hz = 60u;
+    float scale = 1.0f;
+
+    // The window created by CreateWindowExW.
+    bool created = false;
+    std::unordered_map<std::wstring, WNDCLASSEXW> classes;
+    WNDPROC procedure = nullptr;
+    std::intptr_t user_data = 0;
+    DWORD style = 0;
+    DWORD ex_style = 0;
+    int headless_x = 0;
+    int headless_y = 0;
+    int headless_width = 0;
+    int headless_height = 0;
+    bool shown = false;
+    bool headless_focus = false;
+    DWORD window_thread = 0;
+    HWND capture = nullptr;
+    bool tracking_leave = false;
+    std::unordered_map<DWORD, std::shared_ptr<ThreadQueue>> queues;
+    std::condition_variable sent_done;
 };
 
 HostState& state() {
-    static HostState host;
-    return host;
+    static HostState* host = new HostState;  // used during static destruction
+    return *host;
 }
 
 std::array<std::atomic<bool>, 256>& keys() {
@@ -60,10 +107,55 @@ std::array<std::atomic<bool>, 256>& keys() {
     return down;
 }
 
+bool window_exists_locked() noexcept { return state().view != nullptr || state().created; }
+
 bool is_window(HWND window) noexcept {
     if (window != window_handle()) return false;
     const std::lock_guard<std::mutex> lock(state().mutex);
-    return state().view != nullptr;
+    return window_exists_locked();
+}
+
+// Client size: the shell's view, else the headless window's.
+void client_size_locked(int& width, int& height) noexcept {
+    if (state().view != nullptr) {
+        width = state().width;
+        height = state().height;
+    } else {
+        width = state().headless_width;
+        height = state().headless_height;
+    }
+}
+
+std::shared_ptr<ThreadQueue> queue_locked(DWORD thread) {
+    auto& queue = state().queues[thread];
+    if (queue == nullptr) queue = std::make_shared<ThreadQueue>();
+    return queue;
+}
+
+// Posts to the window thread's queue; false without a window thread.
+bool post_to_window_locked(UINT message, WPARAM wparam, LPARAM lparam) {
+    if (!state().created || state().window_thread == 0u) return false;
+    const std::shared_ptr<ThreadQueue> queue = queue_locked(state().window_thread);
+    MSG msg{};
+    msg.hwnd = window_handle();
+    msg.message = message;
+    msg.wParam = wparam;
+    msg.lParam = lparam;
+    msg.time = static_cast<DWORD>(GetTickCount64());
+    msg.pt = POINT{state().pointer_x, state().pointer_y};
+    queue->messages.push_back(msg);
+    queue->changed.notify_all();
+    return true;
+}
+
+WPARAM mouse_key_state() noexcept {
+    WPARAM state_bits = 0;
+    if (keys()[0x01].load(std::memory_order_acquire)) state_bits |= MK_LBUTTON;
+    if (keys()[0x02].load(std::memory_order_acquire)) state_bits |= MK_RBUTTON;
+    if (keys()[0x04].load(std::memory_order_acquire)) state_bits |= MK_MBUTTON;
+    if (keys()[0x05].load(std::memory_order_acquire)) state_bits |= MK_XBUTTON1;
+    if (keys()[0x06].load(std::memory_order_acquire)) state_bits |= MK_XBUTTON2;
+    return state_bits;
 }
 
 FILETIME filetime_from_ns(std::uint64_t nanoseconds) noexcept {
@@ -77,23 +169,76 @@ namespace galaxy::host_platform {
 
 void set_window(void* view, int width, int height, bool visible, bool focused) {
     const std::lock_guard<std::mutex> lock(state().mutex);
+    const bool resized = width != state().width || height != state().height;
+    const bool focus_changed = focused != state().focused;
     state().view = view;
     state().width = width;
     state().height = height;
     state().visible = visible;
     state().focused = focused;
+    if (resized) {
+        (void)post_to_window_locked(WM_SIZE, SIZE_RESTORED, MAKELPARAM(width, height));
+    }
+    if (focus_changed) {
+        (void)post_to_window_locked(WM_ACTIVATEAPP, focused ? TRUE : FALSE, 0);
+        (void)post_to_window_locked(focused ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);
+    }
+}
+
+void set_screen(int width, int height, unsigned refresh_hz, float scale) {
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    state().screen_width = width;
+    state().screen_height = height;
+    state().refresh_hz = refresh_hz != 0u ? refresh_hz : 60u;
+    state().scale = scale > 0.0f ? scale : 1.0f;
 }
 
 void set_pointer(bool inside, int x, int y) {
     const std::lock_guard<std::mutex> lock(state().mutex);
+    const bool left = state().pointer_inside && !inside;
+    const bool moved = inside && (!state().pointer_inside || x != state().pointer_x ||
+                                  y != state().pointer_y);
     state().pointer_inside = inside;
     state().pointer_x = x;
     state().pointer_y = y;
+    if (moved) (void)post_to_window_locked(WM_MOUSEMOVE, mouse_key_state(), MAKELPARAM(x, y));
+    if (left && state().tracking_leave) {
+        state().tracking_leave = false;
+        (void)post_to_window_locked(WM_MOUSELEAVE, 0, 0);
+    }
 }
 
 void set_key(int virtual_key, bool down) {
-    if (virtual_key > 0 && virtual_key < 256) {
-        keys()[static_cast<std::size_t>(virtual_key)].store(down, std::memory_order_release);
+    if (virtual_key <= 0 || virtual_key >= 256) return;
+    const bool was_down =
+        keys()[static_cast<std::size_t>(virtual_key)].exchange(down, std::memory_order_acq_rel);
+    if (was_down == down) return;
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    const LPARAM position = MAKELPARAM(state().pointer_x, state().pointer_y);
+    switch (virtual_key) {
+    case 0x01:
+        (void)post_to_window_locked(down ? WM_LBUTTONDOWN : WM_LBUTTONUP, mouse_key_state(), position);
+        break;
+    case 0x02:
+        (void)post_to_window_locked(down ? WM_RBUTTONDOWN : WM_RBUTTONUP, mouse_key_state(), position);
+        break;
+    case 0x04:
+        (void)post_to_window_locked(down ? WM_MBUTTONDOWN : WM_MBUTTONUP, mouse_key_state(), position);
+        break;
+    case 0x05:
+    case 0x06:
+        (void)post_to_window_locked(down ? WM_XBUTTONDOWN : WM_XBUTTONUP,
+                                    mouse_key_state() |
+                                        (static_cast<WPARAM>(virtual_key == 0x05 ? XBUTTON1 : XBUTTON2) << 16),
+                                    position);
+        break;
+    default: {
+        // lParam: repeat count 1; bit 30 previous state; bit 31 transition.
+        const LPARAM flags = 1 | (down ? 0 : (LPARAM{1} << 30) | (LPARAM{1} << 31));
+        (void)post_to_window_locked(down ? WM_KEYDOWN : WM_KEYUP, static_cast<WPARAM>(virtual_key),
+                                    flags);
+        break;
+    }
     }
 }
 
@@ -399,7 +544,8 @@ BOOL FreeLibrary(HMODULE module) noexcept {
 
 HWND GetForegroundWindow() noexcept {
     const std::lock_guard<std::mutex> lock(state().mutex);
-    return state().view != nullptr && state().focused ? window_handle() : nullptr;
+    if (state().view != nullptr) return state().focused ? window_handle() : nullptr;
+    return state().created && state().headless_focus ? window_handle() : nullptr;
 }
 
 BOOL IsWindow(HWND window) noexcept { return is_window(window) ? TRUE : FALSE; }
@@ -407,7 +553,8 @@ BOOL IsWindow(HWND window) noexcept { return is_window(window) ? TRUE : FALSE; }
 BOOL IsWindowVisible(HWND window) noexcept {
     if (window != window_handle()) return FALSE;
     const std::lock_guard<std::mutex> lock(state().mutex);
-    return state().view != nullptr && state().visible ? TRUE : FALSE;
+    if (state().view != nullptr) return state().visible ? TRUE : FALSE;
+    return state().created && state().shown ? TRUE : FALSE;
 }
 
 DWORD GetWindowThreadProcessId(HWND window, DWORD* process_id) noexcept {
@@ -416,7 +563,8 @@ DWORD GetWindowThreadProcessId(HWND window, DWORD* process_id) noexcept {
         return 0;
     }
     if (process_id != nullptr) *process_id = GetCurrentProcessId();
-    return GetCurrentThreadId();
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    return state().window_thread != 0u ? state().window_thread : GetCurrentThreadId();
 }
 
 BOOL GetCursorPos(POINT* point) noexcept {
@@ -429,10 +577,10 @@ BOOL GetCursorPos(POINT* point) noexcept {
 
 HWND WindowFromPoint(POINT point) noexcept {
     const std::lock_guard<std::mutex> lock(state().mutex);
-    if (state().view == nullptr || !state().visible || !state().pointer_inside) return nullptr;
-    if (point.x < 0 || point.y < 0 || point.x >= state().width || point.y >= state().height) {
-        return nullptr;
-    }
+    if (!window_exists_locked() || !state().pointer_inside) return nullptr;
+    int width = 0, height = 0;
+    client_size_locked(width, height);
+    if (point.x < 0 || point.y < 0 || point.x >= width || point.y >= height) return nullptr;
     return window_handle();
 }
 
@@ -447,8 +595,10 @@ BOOL EnumWindows(WNDENUMPROC callback, LPARAM user) noexcept {
 BOOL GetClientRect(HWND window, RECT* rect) noexcept {
     if (rect == nullptr || window != window_handle()) return FALSE;
     const std::lock_guard<std::mutex> lock(state().mutex);
-    if (state().view == nullptr) return FALSE;
-    *rect = RECT{0, 0, state().width, state().height};
+    if (!window_exists_locked()) return FALSE;
+    int width = 0, height = 0;
+    client_size_locked(width, height);
+    *rect = RECT{0, 0, width, height};
     return TRUE;
 }
 
@@ -473,6 +623,551 @@ short GetAsyncKeyState(int virtual_key) noexcept {
                ? static_cast<short>(0x8000)
                : static_cast<short>(0);
 }
+
+// ---------------------------------------------------------------------------
+// Window classes, creation, messages (galaxy/win32_gui_posix.h)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+thread_local LONG t_message_time = 0;
+
+LRESULT call_procedure(UINT message, WPARAM wparam, LPARAM lparam) {
+    WNDPROC procedure = nullptr;
+    {
+        const std::lock_guard<std::mutex> lock(state().mutex);
+        procedure = state().procedure;
+    }
+    return procedure != nullptr ? procedure(window_handle(), message, wparam, lparam)
+                                : DefWindowProcW(window_handle(), message, wparam, lparam);
+}
+
+constexpr UINT kSentMessage = 0x7FFF0001u;  // internal: a SentMessage in lParam
+
+// Takes the next message for this thread, running sent messages on the way.
+bool next_message(MSG& out, UINT filter_min, UINT filter_max, bool remove, bool wait) {
+    const DWORD thread = GetCurrentThreadId();
+    std::unique_lock<std::mutex> lock(state().mutex);
+    const std::shared_ptr<ThreadQueue> queue = queue_locked(thread);
+    for (;;) {
+        for (auto it = queue->messages.begin(); it != queue->messages.end(); ++it) {
+            if (it->message == kSentMessage) {
+                auto* sent = reinterpret_cast<std::shared_ptr<SentMessage>*>(it->lParam);
+                std::shared_ptr<SentMessage> message = std::move(*sent);
+                delete sent;
+                queue->messages.erase(it);
+                lock.unlock();
+                const LRESULT result = call_procedure(message->message, message->wparam,
+                                                      message->lparam);
+                lock.lock();
+                message->result = result;
+                message->done = true;
+                state().sent_done.notify_all();
+                goto rescan;
+            }
+            const bool in_range = (filter_min == 0u && filter_max == 0u) ||
+                                  (it->message >= filter_min && it->message <= filter_max) ||
+                                  it->message == WM_QUIT;
+            if (!in_range) continue;
+            out = *it;
+            if (remove) queue->messages.erase(it);
+            return true;
+        }
+        if (!wait) return false;
+        queue->changed.wait(lock);
+    rescan:;
+    }
+}
+
+}  // namespace
+
+ATOM RegisterClassExW(const WNDCLASSEXW* window_class) noexcept {
+    if (window_class == nullptr || window_class->lpszClassName == nullptr) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    state().classes[window_class->lpszClassName] = *window_class;
+    return static_cast<ATOM>(0xC000u + state().classes.size());
+}
+
+ATOM RegisterClassW(const WNDCLASSW* window_class) noexcept {
+    if (window_class == nullptr) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    WNDCLASSEXW extended{};
+    extended.cbSize = sizeof(extended);
+    extended.style = window_class->style;
+    extended.lpfnWndProc = window_class->lpfnWndProc;
+    extended.hInstance = window_class->hInstance;
+    extended.lpszClassName = window_class->lpszClassName;
+    return RegisterClassExW(&extended);
+}
+
+BOOL UnregisterClassW(LPCWSTR class_name, HINSTANCE) noexcept {
+    if (class_name == nullptr) return FALSE;
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    return state().classes.erase(class_name) != 0u ? TRUE : FALSE;
+}
+
+HWND CreateWindowExW(DWORD ex_style, LPCWSTR class_name, LPCWSTR, DWORD style, int x, int y,
+                     int width, int height, HWND, HMENU, HINSTANCE, LPVOID) noexcept {
+    {
+        const std::lock_guard<std::mutex> lock(state().mutex);
+        if (state().created || class_name == nullptr) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        const auto found = state().classes.find(class_name);
+        if (found == state().classes.end()) {
+            SetLastError(ERROR_FILE_NOT_FOUND);  // ERROR_CANNOT_FIND_WND_CLASS
+            return nullptr;
+        }
+        state().created = true;
+        state().procedure = found->second.lpfnWndProc;
+        state().style = style;
+        state().ex_style = ex_style;
+        state().headless_x = x == CW_USEDEFAULT ? 0 : x;
+        state().headless_y = y == CW_USEDEFAULT ? 0 : y;
+        state().headless_width = width == CW_USEDEFAULT || width <= 0 ? 1280 : width;
+        state().headless_height = height == CW_USEDEFAULT || height <= 0 ? 720 : height;
+        state().shown = (style & WS_VISIBLE) != 0;
+        state().user_data = 0;
+        state().window_thread = GetCurrentThreadId();
+        (void)queue_locked(state().window_thread);
+    }
+    (void)call_procedure(WM_CREATE, 0, 0);
+    return window_handle();
+}
+
+BOOL DestroyWindow(HWND window) noexcept {
+    if (!is_window(window)) return FALSE;
+    (void)call_procedure(WM_DESTROY, 0, 0);
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    state().created = false;
+    state().procedure = nullptr;
+    state().shown = false;
+    state().headless_focus = false;
+    state().capture = nullptr;
+    return TRUE;
+}
+
+BOOL ShowWindow(HWND window, int command) noexcept {
+    if (!is_window(window)) return FALSE;
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    const BOOL was_visible = state().shown ? TRUE : FALSE;
+    state().shown = command != SW_HIDE && command != SW_MINIMIZE;
+    return was_visible;
+}
+
+BOOL ShowWindowAsync(HWND window, int command) noexcept { return ShowWindow(window, command); }
+BOOL UpdateWindow(HWND window) noexcept { return is_window(window) ? TRUE : FALSE; }
+
+BOOL SetForegroundWindow(HWND window) noexcept {
+    if (!is_window(window)) return FALSE;
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    state().headless_focus = true;
+    return TRUE;
+}
+
+HWND SetActiveWindow(HWND window) noexcept { return is_window(window) ? window : nullptr; }
+
+HWND SetFocus(HWND window) noexcept {
+    if (!is_window(window)) return nullptr;
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    state().headless_focus = true;
+    return window;
+}
+
+LRESULT DefWindowProcW(HWND window, UINT message, WPARAM, LPARAM) noexcept {
+    if (message == WM_CLOSE) (void)DestroyWindow(window);
+    return 0;
+}
+
+std::intptr_t SetWindowLongPtrW(HWND window, int index, std::intptr_t value) noexcept {
+    if (!is_window(window)) return 0;
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    std::intptr_t previous = 0;
+    switch (index) {
+    case GWLP_USERDATA: previous = state().user_data; state().user_data = value; break;
+    case GWL_STYLE: previous = state().style; state().style = static_cast<DWORD>(value); break;
+    case GWL_EXSTYLE: previous = state().ex_style; state().ex_style = static_cast<DWORD>(value); break;
+    case GWLP_WNDPROC:
+        previous = reinterpret_cast<std::intptr_t>(state().procedure);
+        state().procedure = reinterpret_cast<WNDPROC>(value);
+        break;
+    default: break;
+    }
+    return previous;
+}
+
+std::intptr_t GetWindowLongPtrW(HWND window, int index) noexcept {
+    if (!is_window(window)) return 0;
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    switch (index) {
+    case GWLP_USERDATA: return state().user_data;
+    case GWL_STYLE: return static_cast<std::intptr_t>(state().style);
+    case GWL_EXSTYLE: return static_cast<std::intptr_t>(state().ex_style);
+    case GWLP_WNDPROC: return reinterpret_cast<std::intptr_t>(state().procedure);
+    default: return 0;
+    }
+}
+
+BOOL SetWindowPos(HWND window, HWND, int x, int y, int cx, int cy, UINT flags) noexcept {
+    if (!is_window(window)) return FALSE;
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    if ((flags & SWP_SHOWWINDOW) != 0u) state().shown = true;
+    if ((flags & SWP_HIDEWINDOW) != 0u) state().shown = false;
+    // The shell owns its view's geometry; only a headless window moves.
+    if (state().view != nullptr) return TRUE;
+    if ((flags & SWP_NOMOVE) == 0u) {
+        state().headless_x = x;
+        state().headless_y = y;
+    }
+    if ((flags & SWP_NOSIZE) == 0u && cx > 0 && cy > 0 &&
+        (cx != state().headless_width || cy != state().headless_height)) {
+        state().headless_width = cx;
+        state().headless_height = cy;
+        (void)post_to_window_locked(WM_SIZE, SIZE_RESTORED, MAKELPARAM(cx, cy));
+    }
+    return TRUE;
+}
+
+BOOL GetWindowRect(HWND window, LPRECT rect) noexcept {
+    if (rect == nullptr || !is_window(window)) return FALSE;
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    int width = 0, height = 0;
+    client_size_locked(width, height);
+    const int x = state().view != nullptr ? 0 : state().headless_x;
+    const int y = state().view != nullptr ? 0 : state().headless_y;
+    *rect = RECT{x, y, x + width, y + height};
+    return TRUE;
+}
+
+BOOL AdjustWindowRectExForDpi(LPRECT rect, DWORD, BOOL, DWORD, UINT) noexcept {
+    return rect != nullptr ? TRUE : FALSE;  // no frame: client == window
+}
+
+BOOL GetMessageW(LPMSG message, HWND, UINT filter_min, UINT filter_max) noexcept {
+    if (message == nullptr) return -1;
+    MSG next{};
+    (void)next_message(next, filter_min, filter_max, true, true);
+    *message = next;
+    t_message_time = static_cast<LONG>(next.time);
+    return next.message == WM_QUIT ? FALSE : TRUE;
+}
+
+BOOL PeekMessageW(LPMSG message, HWND, UINT filter_min, UINT filter_max, UINT remove) noexcept {
+    if (message == nullptr) return FALSE;
+    MSG next{};
+    if (!next_message(next, filter_min, filter_max, (remove & PM_REMOVE) != 0u, false)) {
+        return FALSE;
+    }
+    *message = next;
+    t_message_time = static_cast<LONG>(next.time);
+    return TRUE;
+}
+
+BOOL TranslateMessage(const MSG*) noexcept { return FALSE; }
+
+LRESULT DispatchMessageW(const MSG* message) noexcept {
+    if (message == nullptr || message->hwnd != window_handle() || !is_window(message->hwnd)) {
+        return 0;
+    }
+    return call_procedure(message->message, message->wParam, message->lParam);
+}
+
+BOOL PostMessageW(HWND window, UINT message, WPARAM wparam, LPARAM lparam) noexcept {
+    if (window != window_handle()) return FALSE;
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    return post_to_window_locked(message, wparam, lparam) ? TRUE : FALSE;
+}
+
+BOOL PostThreadMessageW(DWORD thread, UINT message, WPARAM wparam, LPARAM lparam) noexcept {
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    const std::shared_ptr<ThreadQueue> queue = queue_locked(thread);
+    MSG msg{};
+    msg.message = message;
+    msg.wParam = wparam;
+    msg.lParam = lparam;
+    msg.time = static_cast<DWORD>(GetTickCount64());
+    queue->messages.push_back(msg);
+    queue->changed.notify_all();
+    return TRUE;
+}
+
+void PostQuitMessage(int exit_code) noexcept {
+    (void)PostThreadMessageW(GetCurrentThreadId(), WM_QUIT, static_cast<WPARAM>(exit_code), 0);
+}
+
+LRESULT SendMessageTimeoutW(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT,
+                            UINT timeout, DWORD_PTR* result) noexcept {
+    if (!is_window(window)) return 0;
+    DWORD window_thread = 0;
+    {
+        const std::lock_guard<std::mutex> lock(state().mutex);
+        window_thread = state().window_thread;
+    }
+    if (window_thread == 0u || window_thread == GetCurrentThreadId()) {
+        const LRESULT value = call_procedure(message, wparam, lparam);
+        if (result != nullptr) *result = static_cast<DWORD_PTR>(value);
+        return 1;
+    }
+    auto sent = std::make_shared<SentMessage>();
+    sent->message = message;
+    sent->wparam = wparam;
+    sent->lparam = lparam;
+    std::unique_lock<std::mutex> lock(state().mutex);
+    if (!post_to_window_locked(kSentMessage, 0,
+                               reinterpret_cast<LPARAM>(new std::shared_ptr<SentMessage>(sent)))) {
+        return 0;
+    }
+    const bool done = state().sent_done.wait_for(
+        lock, std::chrono::milliseconds(timeout), [&] { return sent->done; });
+    if (!done) {
+        SetLastError(ERROR_TIMEOUT);
+        return 0;
+    }
+    if (result != nullptr) *result = static_cast<DWORD_PTR>(sent->result);
+    return 1;
+}
+
+LONG GetMessageTime() noexcept { return t_message_time; }
+
+BOOL GetCurrentInputMessageSource(INPUT_MESSAGE_SOURCE* source) noexcept {
+    if (source == nullptr) return FALSE;
+    source->deviceType = IMDT_MOUSE;
+    source->originId = IMO_HARDWARE;
+    return TRUE;
+}
+
+// ---------------------------------------------------------------------------
+// Cursor, capture, keys, resources
+// ---------------------------------------------------------------------------
+
+namespace {
+int g_cursor_identity = 0;
+int g_icon_identity = 0;
+int g_brush_identity = 0;
+}  // namespace
+
+HCURSOR LoadCursorA(HINSTANCE, const char*) noexcept { return &g_cursor_identity; }
+HCURSOR SetCursor(HCURSOR cursor) noexcept { return cursor; }
+
+HWND SetCapture(HWND window) noexcept {
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    const HWND previous = state().capture;
+    state().capture = window;
+    return previous;
+}
+
+BOOL ReleaseCapture() noexcept {
+    bool had = false;
+    {
+        const std::lock_guard<std::mutex> lock(state().mutex);
+        had = state().capture != nullptr;
+        state().capture = nullptr;
+    }
+    if (had) (void)call_procedure(WM_CAPTURECHANGED, 0, 0);
+    return TRUE;
+}
+
+HWND GetCapture() noexcept {
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    return state().capture;
+}
+
+BOOL TrackMouseEvent(TRACKMOUSEEVENT* event) noexcept {
+    if (event == nullptr) return FALSE;
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    state().tracking_leave = (event->dwFlags & TME_LEAVE) != 0u;
+    return TRUE;
+}
+
+UINT MapVirtualKeyA(UINT, UINT) noexcept { return 0u; }  // no scan codes on these hosts
+
+HANDLE LoadImageW(HINSTANCE, LPCWSTR, UINT, int, int, UINT) noexcept { return &g_icon_identity; }
+HGDIOBJ GetStockObject(int) noexcept { return &g_brush_identity; }
+int FillRect(void*, const RECT*, HBRUSH) noexcept { return 1; }
+
+// ---------------------------------------------------------------------------
+// Monitors, display settings, DPI, system
+// ---------------------------------------------------------------------------
+
+namespace {
+int g_monitor_identity = 0;
+
+void screen_locked(int& width, int& height) noexcept {
+    width = state().screen_width;
+    height = state().screen_height;
+    if (width <= 0 || height <= 0) client_size_locked(width, height);
+    if (width <= 0 || height <= 0) {
+        width = 1920;
+        height = 1080;
+    }
+}
+}  // namespace
+
+int GetSystemMetrics(int index) noexcept {
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    int width = 0, height = 0;
+    screen_locked(width, height);
+    switch (index) {
+    case SM_CXSCREEN: return width;
+    case SM_CYSCREEN: return height;
+    case SM_CXICON:
+    case SM_CYICON: return 32;
+    case SM_CXSMICON:
+    case SM_CYSMICON: return 16;
+    default: return 0;
+    }
+}
+
+HMONITOR MonitorFromWindow(HWND, DWORD) noexcept { return &g_monitor_identity; }
+HMONITOR MonitorFromPoint(POINT, DWORD) noexcept { return &g_monitor_identity; }
+
+BOOL GetMonitorInfoW(HMONITOR monitor, MONITORINFO* info) noexcept {
+    if (monitor != &g_monitor_identity || info == nullptr) return FALSE;
+    int width = 0, height = 0;
+    {
+        const std::lock_guard<std::mutex> lock(state().mutex);
+        screen_locked(width, height);
+    }
+    info->rcMonitor = RECT{0, 0, width, height};
+    info->rcWork = info->rcMonitor;
+    info->dwFlags = MONITORINFOF_PRIMARY;
+    if (info->cbSize >= sizeof(MONITORINFOEXW)) {
+        const wchar_t kDevice[] = L"\\\\.\\DISPLAY1";
+        std::wmemcpy(static_cast<MONITORINFOEXW*>(info)->szDevice, kDevice,
+                     sizeof(kDevice) / sizeof(wchar_t));
+    }
+    return TRUE;
+}
+
+BOOL EnumDisplayMonitors(void*, const RECT*, MONITORENUMPROC callback, LPARAM data) noexcept {
+    if (callback == nullptr) return FALSE;
+    RECT bounds{};
+    {
+        const std::lock_guard<std::mutex> lock(state().mutex);
+        int width = 0, height = 0;
+        screen_locked(width, height);
+        bounds = RECT{0, 0, width, height};
+    }
+    (void)callback(&g_monitor_identity, nullptr, &bounds, data);
+    return TRUE;
+}
+
+BOOL EnumDisplaySettingsExW(LPCWSTR, DWORD mode, DEVMODEW* devmode, DWORD) noexcept {
+    if (devmode == nullptr) return FALSE;
+    // One mode: the screen's own.
+    if (mode != ENUM_CURRENT_SETTINGS && mode != ENUM_REGISTRY_SETTINGS && mode != 0u) {
+        return FALSE;
+    }
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    int width = 0, height = 0;
+    screen_locked(width, height);
+    devmode->dmBitsPerPel = 32u;
+    devmode->dmPelsWidth = static_cast<DWORD>(width);
+    devmode->dmPelsHeight = static_cast<DWORD>(height);
+    devmode->dmDisplayFlags = 0u;
+    devmode->dmDisplayFrequency = state().refresh_hz;
+    devmode->dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+    return TRUE;
+}
+
+BOOL EnumDisplaySettingsW(LPCWSTR device, DWORD mode, DEVMODEW* devmode) noexcept {
+    return EnumDisplaySettingsExW(device, mode, devmode, 0u);
+}
+
+UINT GetDpiForSystem() noexcept {
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    return static_cast<UINT>(USER_DEFAULT_SCREEN_DPI * state().scale + 0.5f);
+}
+
+UINT GetDpiForWindow(HWND window) noexcept { return is_window(window) ? GetDpiForSystem() : 0u; }
+
+BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX* status) noexcept {
+    if (status == nullptr) return FALSE;
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    const std::uint64_t total = pages > 0 && page_size > 0
+        ? static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(page_size)
+        : 0u;
+    status->dwMemoryLoad = 0u;
+    status->ullTotalPhys = total;
+    status->ullAvailPhys = total;
+    status->ullTotalPageFile = total;
+    status->ullAvailPageFile = total;
+    status->ullTotalVirtual = std::uint64_t{1} << 47u;
+    status->ullAvailVirtual = std::uint64_t{1} << 47u;
+    status->ullAvailExtendedVirtual = 0u;
+    return total != 0u ? TRUE : FALSE;
+}
+
+// The app shell keeps the display awake (UIApplication.idleTimerDisabled);
+// these succeed without effect.
+HANDLE PowerCreateRequest(REASON_CONTEXT*) noexcept { return &g_icon_identity; }
+BOOL PowerSetRequest(HANDLE, POWER_REQUEST_TYPE) noexcept { return TRUE; }
+BOOL PowerClearRequest(HANDLE, POWER_REQUEST_TYPE) noexcept { return TRUE; }
+
+// ---------------------------------------------------------------------------
+// Strings and waits
+// ---------------------------------------------------------------------------
+
+int WideCharToMultiByte(UINT, DWORD, const wchar_t* wide, int wide_length, char* narrow,
+                        int narrow_size, const char*, BOOL* used_default) noexcept {
+    if (used_default != nullptr) *used_default = FALSE;
+    if (wide == nullptr) return 0;
+    try {
+        const std::wstring text = wide_length < 0 ? std::wstring(wide)
+                                                   : std::wstring(wide, static_cast<std::size_t>(wide_length));
+        std::string converted = galaxy::win32::narrow(text.c_str());
+        if (wide_length < 0) converted.push_back('\0');
+        if (narrow_size == 0 || narrow == nullptr) return static_cast<int>(converted.size());
+        if (static_cast<int>(converted.size()) > narrow_size) {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return 0;
+        }
+        std::memcpy(narrow, converted.data(), converted.size());
+        return static_cast<int>(converted.size());
+    } catch (...) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+}
+
+int MultiByteToWideChar(UINT, DWORD, const char* narrow, int narrow_length, wchar_t* wide,
+                        int wide_size) noexcept {
+    if (narrow == nullptr) return 0;
+    try {
+        const std::string text = narrow_length < 0 ? std::string(narrow)
+                                                   : std::string(narrow, static_cast<std::size_t>(narrow_length));
+        std::wstring converted = galaxy::win32::widen(text.c_str());
+        if (narrow_length < 0) converted.push_back(L'\0');
+        if (wide_size == 0 || wide == nullptr) return static_cast<int>(converted.size());
+        if (static_cast<int>(converted.size()) > wide_size) {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return 0;
+        }
+        std::wmemcpy(wide, converted.data(), converted.size());
+        return static_cast<int>(converted.size());
+    } catch (...) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+}
+
+DWORD WaitForSingleObjectEx(HANDLE handle, DWORD milliseconds, BOOL) noexcept {
+    return WaitForSingleObject(handle, milliseconds);
+}
+
+namespace galaxy::win32_gui {
+bool post_window_message(UINT message, WPARAM wparam, LPARAM lparam) noexcept {
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    return post_to_window_locked(message, wparam, lparam);
+}
+}  // namespace galaxy::win32_gui
 
 // ---------------------------------------------------------------------------
 // XInput

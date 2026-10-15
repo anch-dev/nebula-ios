@@ -14,16 +14,24 @@
 
 namespace galaxy::host_platform {
 
-// The game's window/view. `view` is an opaque native handle (UIView*,
-// NSView*, ...) the renderer also receives; null means no window.
+// The game's window/view. `view` is an opaque native handle (CAMetalLayer*
+// for the Metal renderer) the renderer also receives; null means no window.
+// Size and focus changes reach the renderer's window procedure as WM_SIZE,
+// WM_SETFOCUS/WM_KILLFOCUS and WM_ACTIVATEAPP, as on Windows.
 void set_window(void* view, int width, int height, bool visible, bool focused);
 
+// The screen the view is on: size in pixels, refresh rate, and points to
+// pixels scale (DPI = 96 x scale). Unset: the view's size, 60 Hz, 1x.
+void set_screen(int width, int height, unsigned refresh_hz, float scale);
+
 // Pointer position in window client coordinates (touch or mouse), and
-// whether it is over the window.
+// whether it is over the window. Delivered as WM_MOUSEMOVE (and
+// WM_MOUSELEAVE once tracked).
 void set_pointer(bool inside, int x, int y);
 
 // Virtual-key state (VK_* codes from galaxy/win32_portable.h, including
-// VK_LBUTTON/VK_RBUTTON/VK_MBUTTON for pointer buttons).
+// VK_LBUTTON/VK_RBUTTON/VK_MBUTTON for pointer buttons). Changes are
+// delivered as WM_KEYDOWN/WM_KEYUP or the button messages.
 void set_key(int virtual_key, bool down);
 
 // One pad in XInput's format (XINPUT_GAMEPAD_* buttons, sticks -32768..32767,

@@ -778,6 +778,10 @@ void decode_vertex_stream(
         // write-combined on a discrete GPU, and scattered field stores there each
         // stall. The zeroing of absent texture coordinates is one such case.
         GxVertexOut out;
+        // Every field below is written; the padding too, so a decoded vertex
+        // is fully defined (cached runs compare vertices bytewise).
+        out.padding[0] = 0u;
+        out.padding[1] = 0u;
         const std::byte* vsrc =
             raw_ptr + static_cast<std::size_t>(vi) * src_stride;
         std::size_t off = 0;

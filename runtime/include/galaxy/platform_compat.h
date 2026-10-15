@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <sys/types.h>
 #if !defined(_WIN32)
 #include <strings.h>
 #include <unistd.h>
@@ -206,6 +207,37 @@ inline errno_t _wfopen_s(std::FILE** file, const char* path, const wchar_t* mode
         narrow_mode[i] = static_cast<char>(mode[i]);
     }
     return fopen_s(file, path, narrow_mode);
+}
+
+// 64-bit file positions (off_t is 64-bit on every supported host).
+#ifndef __int64
+#define __int64 long long
+#endif
+inline long long _ftelli64(std::FILE* file) noexcept {
+    return static_cast<long long>(::ftello(file));
+}
+inline int _fseeki64(std::FILE* file, long long offset, int origin) noexcept {
+    return ::fseeko(file, static_cast<off_t>(offset), origin);
+}
+// _wfsopen: share flags are a Windows notion; the path is narrow on POSIX.
+inline std::FILE* _wfsopen(const char* path, const wchar_t* mode, int) noexcept {
+    std::FILE* file = nullptr;
+    return _wfopen_s(&file, path, mode) == 0 ? file : nullptr;
+}
+// swprintf_s(buffer, format, ...) for fixed arrays; formats follow the C
+// library's rules (%s takes a narrow string on POSIX: use %ls).
+template <std::size_t N, typename... Args>
+inline int swprintf_s(wchar_t (&buffer)[N], const wchar_t* format, Args... args) noexcept {
+    const int written = std::swprintf(buffer, N, format, args...);
+    if (written < 0 && N > 0u) buffer[0] = L'\0';
+    return written;
+}
+template <typename... Args>
+inline int swprintf_s(wchar_t* buffer, std::size_t size, const wchar_t* format,
+                      Args... args) noexcept {
+    const int written = std::swprintf(buffer, size, format, args...);
+    if (written < 0 && size > 0u) buffer[0] = L'\0';
+    return written;
 }
 
 inline int _getpid() noexcept { return static_cast<int>(::getpid()); }

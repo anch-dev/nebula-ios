@@ -25,6 +25,7 @@
 // (D3DCOMPILE_PACK_MATRIX_ROW_MAJOR): the same constant bytes work for both.
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -70,6 +71,19 @@ struct Result {
     std::string log;
 };
 
+struct SpirvResult {
+    bool ok = false;
+    std::vector<std::uint32_t> words;
+    std::string log;
+};
+
+// The two halves, for callers that keep the SPIR-V (D3DCompile on these
+// hosts) and generate MSL later, when pipeline state (dual-source blending)
+// is known. HLSL options (defines, entry point, label) apply to the first,
+// MSL options (dual source, platform) to the second.
+[[nodiscard]] SpirvResult hlsl_to_spirv(std::string_view hlsl, Stage stage, const Options& options);
+[[nodiscard]] Result spirv_to_msl(std::span<const std::uint32_t> words, Stage stage,
+                                  const Options& options);
 [[nodiscard]] Result hlsl_to_msl(std::string_view hlsl, Stage stage, const Options& options);
 
 }  // namespace galaxy::gx::xlate

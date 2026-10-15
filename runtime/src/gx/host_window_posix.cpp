@@ -10,7 +10,9 @@
 
 namespace galaxy::gx {
 
-HostClientExtent current_host_client_extent() noexcept {
+// Weak: when the renderer is linked, its definition (renderer_d3d12.cpp,
+// over the same virtual window) is the one used.
+__attribute__((weak)) HostClientExtent current_host_client_extent() noexcept {
     HWND window = nullptr;
     if (EnumWindows(
             [](HWND candidate, LPARAM user) -> BOOL {

@@ -233,8 +233,7 @@ add_custom_target(nebula_runtime_identity
 add_library(galaxy_native_runtime_objects OBJECT
     runtime/src/native_runtime.cpp
     runtime/src/native_thp_video.cpp
-    runtime/src/site_hooks.cpp
-    runtime/src/runtime_main_posix.cpp)
+    runtime/src/site_hooks.cpp)
 add_dependencies(galaxy_native_runtime_objects nebula_runtime_identity)
 target_include_directories(galaxy_native_runtime_objects PRIVATE
     "${galaxy_runtime_include}"
@@ -409,5 +408,123 @@ if(GALAXY_SHADER_TRANSLATOR AND galaxy_can_run_tests)
     if(APPLE)
         target_link_libraries(galaxy_post_shader_translate_tests PRIVATE
             "-framework Metal" "-framework Foundation")
+    endif()
+endif()
+
+# The renderer (galaxy_gx) over a Direct3D 12 subset: the upstream D3D12
+# renderer sources compile unchanged against runtime/compat/win32 (a
+# <Windows.h>, DXGI and D3DCompile for these hosts) and Microsoft's
+# DirectX-Headers (MIT, fetched at a pinned release); runtime/src/d3d12
+# implements the D3D12 objects over Metal (Apple) or a CPU backend.
+if(GALAXY_SHADER_TRANSLATOR)
+    FetchContent_Declare(directx_headers
+        GIT_REPOSITORY https://github.com/microsoft/DirectX-Headers.git
+        GIT_TAG v1.618.2
+        GIT_SHALLOW TRUE)
+    FetchContent_GetProperties(directx_headers)
+    if(NOT directx_headers_POPULATED)
+        FetchContent_Populate(directx_headers)
+    endif()
+    set(galaxy_d3d12_includes
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/compat/win32"
+        "${directx_headers_SOURCE_DIR}/include"
+        "${galaxy_runtime_include}")
+
+    add_library(galaxy_d3d12 STATIC
+        runtime/src/d3d12/device.cpp
+        runtime/src/d3d12/command_list.cpp
+        runtime/src/d3d12/compiler.cpp
+        runtime/src/d3d12/dxgi.cpp
+        runtime/src/d3d12/backend_cpu.cpp)
+    target_include_directories(galaxy_d3d12 PUBLIC ${galaxy_d3d12_includes})
+    target_link_libraries(galaxy_d3d12 PUBLIC galaxy_shader_translate galaxy_win32_posix
+        Threads::Threads)
+
+    set(galaxy_gx_sources
+        runtime/src/gx/gx_shim.cpp
+        runtime/src/gx/gx_headers_compile.cpp
+        runtime/src/gx/frame_completion.cpp
+        runtime/src/gx/renderer_d3d12.cpp
+        runtime/src/gx/window_owner.cpp
+        runtime/src/gx/texture_cache.cpp
+        runtime/src/gx/placed_texture_allocator.cpp
+        runtime/src/gx/vertex_loader.cpp
+        runtime/src/gx/efb_copy.cpp
+        runtime/src/gx/pipeline_cache.cpp
+        runtime/src/gx/post_process.cpp
+        runtime/src/gx/temporal_upscaler.cpp
+        runtime/src/gx/display_modes.cpp
+        runtime/src/gx/gx_backend.cpp)
+    # The post-processing passes as "bytecode" headers: D3DCompile blobs
+    # would need the translator at build time on the build machine, so the
+    # headers carry HLSL instead (see runtime/src/d3d12/compiler.cpp).
+    set(galaxy_post_headers "")
+    file(STRINGS "${galaxy_post_dir}/post_shader_list.h" galaxy_post_entries REGEX "^    \\{")
+    foreach(entry IN LISTS galaxy_post_entries)
+        string(REGEX MATCH "\\{\"([^\"]+)\", \"([^\"]+)\", '(.)', \"([^\"]+)\"\\}" _ "${entry}")
+        set(name "${CMAKE_MATCH_1}")
+        set(source "${CMAKE_MATCH_2}")
+        set(stage "${CMAKE_MATCH_3}")
+        set(entry_point "${CMAKE_MATCH_4}")
+        set(header "${galaxy_post_dir}/${name}.h")
+        add_custom_command(OUTPUT "${header}"
+            COMMAND "${CMAKE_COMMAND}" -DSOURCE=${source} -DHEADER=${header} -DNAME=g_${name}
+                -DSTAGE=${stage} -DENTRY=${entry_point}
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/hlsl_source_blob.cmake"
+            DEPENDS "${source}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/hlsl_source_blob.cmake"
+            VERBATIM)
+        list(APPEND galaxy_post_headers "${header}")
+    endforeach()
+
+    add_library(galaxy_gx STATIC ${galaxy_gx_sources} ${galaxy_post_headers})
+    target_include_directories(galaxy_gx
+        PUBLIC ${galaxy_d3d12_includes}
+        PRIVATE "${galaxy_post_dir}" "${CMAKE_CURRENT_SOURCE_DIR}/third_party/smaa"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src")
+    target_compile_definitions(galaxy_gx PRIVATE GALAXY_WITH_STREAMLINE_BRIDGE=0)
+    target_link_libraries(galaxy_gx PUBLIC galaxy_gx_core galaxy_d3d12 galaxy_native_host
+        galaxy_frame_cadence_diagnostics galaxy_runtime_settings galaxy_host_pointer_events
+        galaxy_frame_telemetry)
+endif()
+
+if(GALAXY_SHADER_TRANSLATOR)
+    # The runtime as a library, for an executable's main (Linux/macOS) or the
+    # iOS app (step 9), which call galaxy_runtime_main.
+    add_library(galaxy_native_runtime STATIC $<TARGET_OBJECTS:galaxy_native_runtime_objects>)
+    target_link_libraries(galaxy_native_runtime PUBLIC
+        galaxy_native_host galaxy_native_input_causality galaxy_gx galaxy_ppc_float
+        galaxy_checkpoint_gate galaxy_decrementer_deadline galaxy_runtime_timeline
+        galaxy_jaudio_mixer galaxy_runtime_instance galaxy_coop_scheduler
+        galaxy_flat_guest_memory ${CMAKE_DL_LIBS})
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        add_executable(NebulaRuntime runtime/src/runtime_main_posix.cpp)
+        target_link_libraries(NebulaRuntime PRIVATE galaxy_native_runtime)
+        # The game module resolves its runtime imports from the executable.
+        set_target_properties(NebulaRuntime PROPERTIES ENABLE_EXPORTS ON)
+    endif()
+endif()
+
+if(GALAXY_SHADER_TRANSLATOR)
+    # Upstream renderer tests over the D3D12 layer.
+    foreach(name IN ITEMS vertex_loader_tests frame_completion_tests memory_snapshot_tests
+            sampler_key_tests xfb_present_selection_tests native_settings_overlay_tests
+            window_owner_tests)
+        galaxy_portable_test(${name} SOURCES runtime/src/gx/${name}.cpp LIBS galaxy_gx)
+    endforeach()
+    # These check rasterized pixels, so they need the Metal backend.
+    if(APPLE AND GALAXY_METAL_BACKEND)
+        foreach(name IN ITEMS post_process_tests efb_conversion_tests line_point_raster_tests)
+            galaxy_portable_test(${name} SOURCES runtime/src/gx/${name}.cpp LIBS galaxy_gx)
+        endforeach()
+    endif()
+    if(galaxy_can_run_tests)
+        add_executable(galaxy_pipeline_cache_persistence_tests
+            runtime/src/gx/pipeline_cache_persistence_tests.cpp
+            runtime/src/gx/pipeline_cache.cpp)
+        target_compile_definitions(galaxy_pipeline_cache_persistence_tests
+            PRIVATE GALAXY_PIPELINE_CACHE_PERSISTENCE_TEST_IO=1)
+        target_link_libraries(galaxy_pipeline_cache_persistence_tests PRIVATE galaxy_gx)
+        add_test(NAME pipeline_cache_persistence_tests
+            COMMAND galaxy_pipeline_cache_persistence_tests)
     endif()
 endif()

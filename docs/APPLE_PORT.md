@@ -106,15 +106,40 @@ timeline race test can time out under heavy QEMU load only).
      configuration build on POSIX (`galaxy_gx_core`) with their upstream
      tests. SSE kernels run on AArch64 through sse2neon (vendored, MIT).
 
+7b. **The renderer over a D3D12 subset** — rather than rewrite the 17k-line
+   D3D12 renderer (EFB copies and peeks, texture and pipeline caches,
+   post-processing, frame pacing) for Metal, the upstream renderer sources
+   compile unchanged and run on a Direct3D 12 implementation for these
+   hosts, the same approach as the Win32 shim:
+   - `runtime/compat/win32/`: `<Windows.h>`, `<d3d12.h>`, DXGI and
+     `<d3dcompiler.h>` for Apple/Linux, over Microsoft's DirectX-Headers
+     (MIT, fetched at v1.618.2).
+   - `win32_gui_posix.h`: the window system the renderer's window thread
+     uses (class, window, message loop, capture, one monitor). The app
+     shell's view, size, focus, pointer and keys arrive as WM_* messages.
+   - `runtime/src/d3d12/`: the D3D12 objects (resources and a GPU virtual
+     address space, descriptor heaps and tables, root signatures, pipeline
+     state, command recording, queues and fences), DXGI (factory, adapter,
+     output, swap chain) and D3DCompile, which compiles HLSL to SPIR-V
+     (errors surface there, as with fxc). Execution is a backend's: Metal
+     on Apple hosts (next), a CPU backend elsewhere that runs copies,
+     clears and readbacks but no draws.
+   - `NebulaRuntime` links on Linux; the upstream vertex-loader, memory
+     snapshot, frame-completion, sampler, XFB-selection, settings-overlay,
+     window-owner and pipeline-cache-persistence tests pass over it. The
+     pixel tests (EFB conversion, line/point raster, post-processing) wait
+     for the Metal backend.
+   - Fixed on the way (all platforms): a decoded vertex's padding was left
+     uninitialized, which made cached draw runs compare unequal.
+
 ## Next steps
 
-7. **Renderer**: a Metal backend beside `renderer_d3d12.cpp` (~11k lines),
-   HLSL uber-shaders → MSL. GX parsing/state above it is shared.
-   `native_runtime.cpp` is compiled (`galaxy_native_runtime_objects`) but
-   not yet linked: what it still needs is the `galaxy::gx` interface
-   (`initialize`, `render_frame`, `pump_messages`, `peek_efb`,
-   `present_cached_xfb`, the PE-completion waits, the settings overlay,
-   about 40 functions in all) that `galaxy_gx` implements on D3D12.
+7c. **Metal backend** for the D3D12 layer: resources as MTLBuffer/MTLTexture,
+   recorded commands encoded into render/blit encoders, pipelines from
+   SPIR-V → MSL (`shader_translate.h`) with vertex descriptors from the
+   input layout, presentation into the app shell's CAMetalLayer. GX
+   lines/points (geometry shaders on D3D12) are drawn as Metal lines and
+   points at first.
 8. **Game module pipeline**: generated C++ → arm64 dylib(s) built on the
    user's PC (stock clang + lld, `-target arm64-apple-ios`), injected into the
    IPA before sideloading. Needs a header set that does not depend on the iOS

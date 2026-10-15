@@ -1621,7 +1621,7 @@ unsigned swap_chain_frame_latency() {
 // discrete adapter this is context only. Queried once; the value cannot change
 // during a session.
 std::uint64_t host_ram_mb() {
-    static const std::uint64_t megabytes = [] {
+    static const std::uint64_t megabytes = []() -> std::uint64_t {
         MEMORYSTATUSEX status{};
         status.dwLength = sizeof(status);
         if (GlobalMemoryStatusEx(&status) == FALSE) {
@@ -1702,7 +1702,7 @@ galaxy::host::HostPointerCursorPollMode mouse_ir_cursor_poll_mode() {
 }
 
 std::uint64_t mouse_ir_message_recent_ms() {
-    static const std::uint64_t value = [] {
+    static const std::uint64_t value = []() -> std::uint64_t {
         char text[16]{};
         std::size_t length = 0;
         if (getenv_s(
@@ -1718,7 +1718,7 @@ std::uint64_t mouse_ir_message_recent_ms() {
 }
 
 std::uint64_t mouse_ir_stale_center_reject_ms() {
-    static const std::uint64_t value = [] {
+    static const std::uint64_t value = []() -> std::uint64_t {
         char text[16]{};
         std::size_t length = 0;
         if (getenv_s(
@@ -5049,7 +5049,8 @@ RECT windowed_rect_on_monitor(const MonitorInfo& monitor, unsigned width,
     const long outer_h = client_h + frame_h;
     const long left = monitor.work_area.left + std::max(0L, (work_w - outer_w) / 2);
     const long top = monitor.work_area.top + std::max(0L, (work_h - outer_h) / 2);
-    return RECT{left, top, left + outer_w, top + outer_h};
+    return RECT{static_cast<LONG>(left), static_cast<LONG>(top),
+                static_cast<LONG>(left + outer_w), static_cast<LONG>(top + outer_h)};
 }
 }  // namespace
 

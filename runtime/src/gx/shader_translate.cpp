@@ -112,8 +112,8 @@ std::string preamble(const Options& options) {
 
 }  // namespace
 
-Result hlsl_to_msl(std::string_view hlsl, Stage stage, const Options& options) {
-    Result result;
+SpirvResult hlsl_to_spirv(std::string_view hlsl, Stage stage, const Options& options) {
+    SpirvResult result;
     initialize_glslang();
     try {
         const EShLanguage language = glslang_stage(stage);
@@ -143,17 +143,26 @@ Result hlsl_to_msl(std::string_view hlsl, Stage stage, const Options& options) {
             result.log = std::string("link: ") + program.getInfoLog() + program.getInfoDebugLog();
             return result;
         }
-        std::vector<std::uint32_t> spirv;
         glslang::SpvOptions spv_options;
         spv_options.disableOptimizer = true;
         spv_options.validate = false;
-        glslang::GlslangToSpv(*program.getIntermediate(language), spirv, &spv_options);
-        if (spirv.empty()) {
+        glslang::GlslangToSpv(*program.getIntermediate(language), result.words, &spv_options);
+        if (result.words.empty()) {
             result.log = "SPIR-V generation produced no code";
             return result;
         }
+        result.ok = true;
+    } catch (const std::exception& error) {
+        result.log += std::string("SPIR-V: ") + error.what();
+        result.ok = false;
+    }
+    return result;
+}
 
-        spirv_cross::CompilerMSL msl(std::move(spirv));
+Result spirv_to_msl(std::span<const std::uint32_t> words, Stage stage, const Options& options) {
+    Result result;
+    try {
+        spirv_cross::CompilerMSL msl(words.data(), words.size());
         spirv_cross::CompilerMSL::Options msl_options;
         msl_options.platform = options.platform == Platform::iOS
             ? spirv_cross::CompilerMSL::Options::iOS
@@ -237,6 +246,16 @@ Result hlsl_to_msl(std::string_view hlsl, Stage stage, const Options& options) {
         result.ok = false;
     }
     return result;
+}
+
+Result hlsl_to_msl(std::string_view hlsl, Stage stage, const Options& options) {
+    const SpirvResult spirv = hlsl_to_spirv(hlsl, stage, options);
+    if (!spirv.ok) {
+        Result result;
+        result.log = spirv.log;
+        return result;
+    }
+    return spirv_to_msl(spirv.words, stage, options);
 }
 
 }  // namespace galaxy::gx::xlate
