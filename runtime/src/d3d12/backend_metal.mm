@@ -119,6 +119,23 @@ MTLPixelFormat pixel_format(DXGI_FORMAT format) noexcept {
     }
 }
 
+// How a depth format's texels look in D3D12 buffer copies. Metal stores
+// them all as 32-bit float, so the packed layouts are converted by shaders.
+enum class DepthLayout : std::uint32_t { D24S8 = 0u, D32S8X24 = 1u, Native = 2u };
+DepthLayout depth_layout(DXGI_FORMAT format) noexcept {
+    switch (format) {
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+    case DXGI_FORMAT_X24_TYPELESS_G8_UINT: return DepthLayout::D24S8;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+    case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: return DepthLayout::D32S8X24;
+    default: return DepthLayout::Native;
+    }
+}
+
 bool is_depth_format(MTLPixelFormat format) noexcept {
     return format == MTLPixelFormatDepth32Float || format == MTLPixelFormatDepth16Unorm ||
            format == MTLPixelFormatDepth32Float_Stencil8;
@@ -697,6 +714,31 @@ fragment ClearOut clear_fs(Fullscreen in [[stage_in]], constant ClearValues& v [
     ClearOut out; out.c0 = v.color; out.c1 = v.color; out.c2 = v.color; out.c3 = v.color;
     return out;
 }
+// Depth texels <-> D3D12 copy layouts (mode 0: D24 unorm, stencil byte 0;
+// mode 1: D32 float + 32 bits of stencil/padding).
+struct DepthCopy { uint x, y, width, height, level, offset_words, row_words, mode; };
+kernel void depth_to_buffer(depth2d<float> source [[texture(0)]], device uint* out [[buffer(0)]],
+                            constant DepthCopy& p [[buffer(1)]], uint2 id [[thread_position_in_grid]]) {
+    if (id.x >= p.width || id.y >= p.height) return;
+    const float depth = source.read(uint2(p.x, p.y) + id, p.level);
+    const uint row = p.offset_words + id.y * p.row_words;
+    if (p.mode == 0u) {
+        out[row + id.x] = uint(rint(saturate(depth) * 16777215.0));
+    } else {
+        out[row + id.x * 2u] = as_type<uint>(depth);
+        out[row + id.x * 2u + 1u] = 0u;
+    }
+}
+struct DepthOut { float depth [[depth(any)]]; };
+fragment DepthOut depth_from_buffer(Fullscreen in [[stage_in]], const device uint* words [[buffer(0)]],
+                                    constant DepthCopy& p [[buffer(1)]]) {
+    const uint2 at = uint2(in.position.xy) - uint2(p.x, p.y);
+    const uint row = p.offset_words + at.y * p.row_words;
+    DepthOut out;
+    out.depth = p.mode == 0u ? float(words[row + at.x] & 0xffffffu) / 16777215.0
+                             : as_type<float>(words[row + at.x * 2u]);
+    return out;
+}
 )MSL";
         NSError* failure = nil;
         internal_library_ = [device_ newLibraryWithSource:[NSString stringWithUTF8String:kSource]
@@ -742,6 +784,38 @@ fragment ClearOut clear_fs(Fullscreen in [[stage_in]], constant ClearValues& v [
         id<MTLRenderPipelineState> state = [device_ newRenderPipelineStateWithDescriptor:d error:nil];
         clear_pipelines_.emplace(key, state);
         return state;
+    }
+
+    id<MTLComputePipelineState> depth_to_buffer_pipeline() {
+        const std::lock_guard<std::mutex> lock(clear_mutex_);
+        if (depth_to_buffer_ == nil) {
+            id<MTLFunction> function = [internal_library() newFunctionWithName:@"depth_to_buffer"];
+            NSError* failure = nil;
+            depth_to_buffer_ = [device_ newComputePipelineStateWithFunction:function error:&failure];
+            if (depth_to_buffer_ == nil) {
+                std::cerr << "[metal] depth_to_buffer: "
+                          << (failure != nil ? [[failure localizedDescription] UTF8String] : "?") << '\n';
+            }
+        }
+        return depth_to_buffer_;
+    }
+
+    id<MTLRenderPipelineState> depth_from_buffer_pipeline(MTLPixelFormat depth) {
+        const std::lock_guard<std::mutex> lock(clear_mutex_);
+        if (depth_from_buffer_ == nil) {
+            id<MTLLibrary> library = internal_library();
+            MTLRenderPipelineDescriptor* d = [[MTLRenderPipelineDescriptor alloc] init];
+            d.vertexFunction = [library newFunctionWithName:@"fullscreen_vs"];
+            d.fragmentFunction = [library newFunctionWithName:@"depth_from_buffer"];
+            d.depthAttachmentPixelFormat = depth;
+            NSError* failure = nil;
+            depth_from_buffer_ = [device_ newRenderPipelineStateWithDescriptor:d error:&failure];
+            if (depth_from_buffer_ == nil) {
+                std::cerr << "[metal] depth_from_buffer: "
+                          << (failure != nil ? [[failure localizedDescription] UTF8String] : "?") << '\n';
+            }
+        }
+        return depth_from_buffer_;
     }
 
     id<MTLDepthStencilState> depth_state(bool write) {
@@ -1153,15 +1227,84 @@ fragment ClearOut clear_fs(Fullscreen in [[stage_in]], constant ClearValues& v [
         }
         void end_encoders() {
             end_render();
+            end_blit();
+            end_compute();
+        }
+        void end_blit() {
             if (blit_ != nil) {
                 [blit_ endEncoding];
                 blit_ = nil;
             }
         }
+        void end_compute() {
+            if (compute_ != nil) {
+                [compute_ endEncoding];
+                compute_ = nil;
+            }
+        }
         id<MTLBlitCommandEncoder> blit() {
             end_render();
+            end_compute();
             if (blit_ == nil) blit_ = [commands_ blitCommandEncoder];
             return blit_;
+        }
+        id<MTLComputeCommandEncoder> compute() {
+            end_render();
+            end_blit();
+            if (compute_ == nil) compute_ = [commands_ computeCommandEncoder];
+            return compute_;
+        }
+
+        struct DepthCopyParams {
+            std::uint32_t x, y, width, height, level, offset_words, row_words, mode;
+        };
+
+        // A packed-depth texture region -> D3D12 buffer layout.
+        void depth_to_buffer(MetalTexture& texture, DepthLayout layout, NSUInteger level, const D3D12_BOX& box,
+                             MetalBuffer& buffer, std::uint64_t offset, std::uint32_t row_pitch) {
+            id<MTLComputePipelineState> state = backend_.depth_to_buffer_pipeline();
+            if (state == nil || (offset % 4u) != 0u || (row_pitch % 4u) != 0u) return;
+            const DepthCopyParams p{box.left, box.top, box.right - box.left, box.bottom - box.top,
+                                    static_cast<std::uint32_t>(level), static_cast<std::uint32_t>(offset / 4u),
+                                    row_pitch / 4u, static_cast<std::uint32_t>(layout)};
+            id<MTLComputeCommandEncoder> encoder = compute();
+            [encoder setComputePipelineState:state];
+            [encoder setTexture:texture.texture() atIndex:0];
+            [encoder setBuffer:buffer.buffer() offset:0 atIndex:0];
+            [encoder setBytes:&p length:sizeof(p) atIndex:1];
+            [encoder dispatchThreads:MTLSizeMake(p.width, p.height, 1)
+               threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        }
+
+        // D3D12 buffer layout -> a packed-depth texture region (drawn: Metal
+        // cannot write depth textures from compute or blit converted data).
+        void depth_from_buffer(MetalTexture& texture, DepthLayout layout, NSUInteger level, MTLOrigin origin,
+                               MTLSize size, MetalBuffer& buffer, std::uint64_t offset, std::uint32_t row_pitch) {
+            id<MTLRenderPipelineState> state = backend_.depth_from_buffer_pipeline([texture.texture() pixelFormat]);
+            if (state == nil || (offset % 4u) != 0u || (row_pitch % 4u) != 0u) return;
+            end_encoders();
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.depthAttachment.texture = texture.texture();
+            pass.depthAttachment.level = level;
+            pass.depthAttachment.loadAction = MTLLoadActionLoad;
+            pass.depthAttachment.storeAction = MTLStoreActionStore;
+            const NSUInteger width = std::max<NSUInteger>([texture.texture() width] >> level, 1u);
+            const NSUInteger height = std::max<NSUInteger>([texture.texture() height] >> level, 1u);
+            if (origin.x >= width || origin.y >= height) return;
+            id<MTLRenderCommandEncoder> encoder = [commands_ renderCommandEncoderWithDescriptor:pass];
+            [encoder setRenderPipelineState:state];
+            [encoder setDepthStencilState:backend_.depth_state(true)];
+            [encoder setViewport:MTLViewport{0.0, 0.0, static_cast<double>(width), static_cast<double>(height), 0.0, 1.0}];
+            [encoder setScissorRect:MTLScissorRect{origin.x, origin.y, std::min(size.width, width - origin.x),
+                                                   std::min(size.height, height - origin.y)}];
+            const DepthCopyParams p{static_cast<std::uint32_t>(origin.x), static_cast<std::uint32_t>(origin.y),
+                                    static_cast<std::uint32_t>(size.width), static_cast<std::uint32_t>(size.height),
+                                    static_cast<std::uint32_t>(level), static_cast<std::uint32_t>(offset / 4u),
+                                    row_pitch / 4u, static_cast<std::uint32_t>(layout)};
+            [encoder setFragmentBuffer:buffer.buffer() offset:0 atIndex:0];
+            [encoder setFragmentBytes:&p length:sizeof(p) atIndex:1];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [encoder endEncoding];
         }
 
         // -- clears
@@ -1273,6 +1416,13 @@ fragment ClearOut clear_fs(Fullscreen in [[stage_in]], constant ClearValues& v [
                 const std::uint64_t offset = fp.Offset + std::uint64_t{box.front} * fp.Footprint.RowPitch * rows +
                                              (box.top / info.block_height) * std::uint64_t{fp.Footprint.RowPitch} +
                                              (box.left / info.block_width) * std::uint64_t{info.bytes_per_block};
+                if (const DepthLayout layout = depth_layout(texture->desc().Format);
+                    is_depth_format([texture->texture() pixelFormat]) && layout != DepthLayout::Native) {
+                    depth_from_buffer(*texture, layout, subresource % mips, MTLOriginMake(c.dst_x, c.dst_y, 0),
+                                      MTLSizeMake(box.right - box.left, box.bottom - box.top, 1), *buffer, offset,
+                                      fp.Footprint.RowPitch);
+                    return;
+                }
                 [blit() copyFromBuffer:buffer->buffer()
                           sourceOffset:offset
                      sourceBytesPerRow:fp.Footprint.RowPitch
@@ -1301,6 +1451,11 @@ fragment ClearOut clear_fs(Fullscreen in [[stage_in]], constant ClearValues& v [
                 const std::uint64_t offset = fp.Offset + std::uint64_t{c.dst_z} * fp.Footprint.RowPitch * rows +
                                              (c.dst_y / info.block_height) * std::uint64_t{fp.Footprint.RowPitch} +
                                              (c.dst_x / info.block_width) * std::uint64_t{info.bytes_per_block};
+                if (const DepthLayout layout = depth_layout(texture->desc().Format);
+                    is_depth_format([texture->texture() pixelFormat]) && layout != DepthLayout::Native) {
+                    depth_to_buffer(*texture, layout, level, box, *buffer, offset, fp.Footprint.RowPitch);
+                    return;
+                }
                 [blit() copyFromTexture:texture->texture()
                             sourceSlice:subresource / mips
                             sourceLevel:level
@@ -1358,6 +1513,7 @@ fragment ClearOut clear_fs(Fullscreen in [[stage_in]], constant ClearValues& v [
         id<MTLCommandBuffer> commands_;
         id<MTLRenderCommandEncoder> render_ = nil;
         id<MTLBlitCommandEncoder> blit_ = nil;
+        id<MTLComputeCommandEncoder> compute_ = nil;
         LONG pass_width_ = 0;
         LONG pass_height_ = 0;
 
@@ -1403,6 +1559,8 @@ fragment ClearOut clear_fs(Fullscreen in [[stage_in]], constant ClearValues& v [
     std::unordered_map<std::uint64_t, id<MTLRenderPipelineState>> clear_pipelines_;
     id<MTLDepthStencilState> depth_write_always_ = nil;
     id<MTLDepthStencilState> depth_disabled_ = nil;
+    id<MTLComputePipelineState> depth_to_buffer_ = nil;
+    id<MTLRenderPipelineState> depth_from_buffer_ = nil;
     std::atomic<bool> logic_op_reported_{false};
 };
 
