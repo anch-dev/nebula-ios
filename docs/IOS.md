@@ -7,21 +7,17 @@ RMGE01, revision 0) and SideStore or AltStore on the device. No Mac is needed.
 Nothing from the game is uploaded anywhere: GitHub builds the app without any game code, and
 your PC compiles the game code from your own copy and adds it to the app.
 
-## 1. Download the builds
+## 1. Download the build
 
 From this repository's **Actions** tab, open the latest successful **Apple port** run and
-download two artifacts:
-
-- `Nebula-ipa`: the app (`Nebula.ipa`), without game code;
-- `nebula-ios-pc-kit`: `nebula-recomp.exe` (the recompiler), `build-modules.ps1` and the iOS
-  module SDK.
-
-Unzip both into one folder, for example `C:\nebula-ios`.
+download the `nebula-ios-pc-kit` artifact. It holds `Nebula.ipa` (the app, without game code),
+`nebula-recomp.exe` (the recompiler), `build-modules.ps1` and the iOS module SDK. Unzip it,
+for example to `C:\nebula-ios`.
 
 ## 2. Install LLVM
 
-Install LLVM for Windows (19 or newer) from <https://github.com/llvm/llvm-project/releases>
-(`LLVM-<version>-win64.exe`). The default location, `C:\Program Files\LLVM`, is where the
+Install LLVM for Windows, 20 or newer (CI checks with the current release), from
+<https://github.com/llvm/llvm-project/releases> (`LLVM-<version>-win64.exe`). The default location, `C:\Program Files\LLVM`, is where the
 script looks; otherwise pass `-Llvm <folder with clang++.exe>`.
 
 ## 3. Build the game modules and the IPA

@@ -62,11 +62,14 @@ sort -u "$deps" | while read -r file; do
         ;;
     "$sdk"/*)
         rel=${file#"$sdk"/}
+        [ -e "$out/sysroot/$rel" ] && continue
         mkdir -p "$out/sysroot/$(dirname "$rel")"
         cp "$file" "$out/sysroot/$rel"
         ;;
     esac
 done
+# The SDK's files are read-only; the kit's need not be.
+chmod -R u+w "$out"
 rm -f "$deps" "$deps.d"
 
 # Link stubs (text). libSystem re-exports usr/lib/system/*.

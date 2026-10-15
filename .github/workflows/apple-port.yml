@@ -121,6 +121,10 @@ jobs:
         with:
           name: nebula-ios-module-sdk
           path: nebula-ios-module-sdk
+      - uses: actions/download-artifact@v4
+        with:
+          name: Nebula-ipa
+          path: .
       - name: Build nebula-recomp
         run: cargo build --release --locked -p nebula-recomp
       - name: Add real recompiler output (public synthetic code) to the test tree
@@ -137,18 +141,25 @@ jobs:
         run: |
           & "C:\Program Files\LLVM\bin\clang++.exe" --version | Select-Object -First 1 | ForEach-Object { "::notice::$_" }
           try {
-            ./tools/ios/build-modules.ps1 -Generated tools/ios/test/fake-generated -Sdk nebula-ios-module-sdk -Out module-test *>&1 | Tee-Object -FilePath modules.log
+            ./tools/ios/build-modules.ps1 -Generated tools/ios/test/fake-generated -Sdk nebula-ios-module-sdk -Ipa Nebula.ipa -Out module-test *>&1 | Tee-Object -FilePath modules.log
           } catch {
             Select-String -Path modules.log -Pattern 'error' | Select-Object -First 15 | ForEach-Object { "::error::$($_.Line)" }
             throw
           }
           & "C:\Program Files\LLVM\bin\llvm-nm.exe" -gU module-test/Frameworks/RMGE01_game.framework/RMGE01_game
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead("$PWD/module-test/Nebula-SMG.ipa")
+          $names = $zip.Entries.FullName
+          $zip.Dispose()
+          foreach ($m in 'RMGE01_game', 'RMGE01_home_button', 'RMGE01_dsp') {
+            if ($names -notcontains "Payload/Nebula.app/Frameworks/$m.framework/$m") { throw "$m is not in the IPA" }
+          }
       - name: Package the PC kit
         shell: pwsh
         run: |
           New-Item -ItemType Directory kit | Out-Null
-          Copy-Item target/release/nebula-recomp.exe, tools/ios/build-modules.ps1 kit/
+          Copy-Item target/release/nebula-recomp.exe, tools/ios/build-modules.ps1, Nebula.ipa kit/
           Copy-Item -Recurse nebula-ios-module-sdk kit/nebula-ios-module-sdk
       - uses: actions/upload-artifact@v4
         with:
