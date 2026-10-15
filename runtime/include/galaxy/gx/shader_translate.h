@@ -41,6 +41,12 @@ inline constexpr std::uint32_t kSpace1BufferBase = 8u;
 // The renderer's vertex buffer index: above every constant/structured
 // buffer the shaders use.
 inline constexpr std::uint32_t kVertexBufferIndex = 30u;
+// Options::capture_output: where the vertex shader writes its outputs
+// (one `<entry>_out` per vertex) and reads its parameters
+// ({vertex count per instance, ...}). Below the vertex buffers (30 - slot,
+// 8 slots) and above the space1 buffers.
+inline constexpr std::uint32_t kCaptureOutputIndex = 20u;
+inline constexpr std::uint32_t kCaptureParamsIndex = 21u;
 
 struct Options {
     std::string entry_point = "main";
@@ -53,6 +59,9 @@ struct Options {
     // Vertex shaders drawn as points: write [[point_size]] (default 1)
     // when the shader does not, as Metal requires.
     bool points = false;
+    // Vertex shaders: write the outputs to a buffer instead of rasterizing
+    // (geometry-shader emulation reads them back).
+    bool capture_output = false;
     // Name for diagnostics.
     std::string label;
 };

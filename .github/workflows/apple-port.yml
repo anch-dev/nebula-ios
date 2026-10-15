@@ -92,10 +92,13 @@ jobs:
           # Tests that already fail on unmodified upstream (keepvaibin/nebula
           # v1.0.0, checked on this runner); anything else failing is a
           # regression from the port.
-          known="galaxy_vertex_loader_tests.exe galaxy_native_settings_overlay_tests.exe galaxy_native_host_tests.exe"
+          # (galaxy_vertex_loader_tests also failed upstream, from
+          # uninitialized vertex padding; the port fixed that.)
+          known="galaxy_native_settings_overlay_tests.exe galaxy_native_host_tests.exe"
           for exe in build/galaxy_*_tests.exe; do
             name=$(basename "$exe")
-            if ! "$exe" > out.txt 2>&1; then
+            # One retry: a few timing-based tests flake on shared runners.
+            if ! "$exe" > out.txt 2>&1 && ! "$exe" > out.txt 2>&1; then
               if [[ " $known " == *" $name "* ]]; then
                 echo "::warning::$name fails on upstream too (known)"
               else

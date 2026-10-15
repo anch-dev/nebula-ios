@@ -308,7 +308,138 @@ MetalTexture* texture_of(Resource* resource) noexcept {
 struct CompiledShader {
     id<MTLFunction> function;
     std::vector<xlate::VertexInput> vertex_inputs;
+    std::string msl;  // kept for capture-mode vertex shaders only
 };
+
+// GX wide lines and points: D3D12 expands them with geometry shaders
+// (shader_gen.cpp kLineGeometryShader / kPointGeometryShader), which Metal
+// does not have. The pipeline's vertex shader instead runs with its outputs
+// captured to a buffer (rasterization off), then a generated vertex shader
+// reads them back and does the geometry shader's expansion, six vertices
+// (two triangles) per primitive, with the original pixel shader.
+enum class Expansion : std::uint8_t { None, Lines, Points };
+
+// Index buffer slots of the expansion pass (unused by GX shaders).
+constexpr NSUInteger kExpandCapturedIndex = xlate::kCaptureOutputIndex;  // also the capture pass output
+constexpr NSUInteger kExpandIndicesIndex = 21u;
+constexpr NSUInteger kExpandParamsIndex = 22u;
+
+struct ExpandParams {
+    std::uint32_t first;
+    std::uint32_t indexed;
+    std::uint32_t wide;
+    std::int32_t base_vertex;
+    std::uint32_t strip;
+    std::uint32_t pad[3];
+};
+
+// Builds the expansion vertex shader from the capture-mode vertex shader's
+// MSL: its output struct is the captured element and the return type.
+bool expansion_source(const std::string& msl, const std::string& entry, Expansion kind, std::string& source,
+                      std::uint32_t& stride, std::string& error) {
+    const std::string head = "struct " + entry + "_out\n{\n";
+    const std::size_t begin = msl.find(head);
+    const std::size_t end = begin == std::string::npos ? begin : msl.find("};", begin);
+    if (begin == std::string::npos || end == std::string::npos) {
+        error = "no vertex output struct to expand";
+        return false;
+    }
+    const std::string body = msl.substr(begin + head.size(), end - begin - head.size());
+    if (body.find("spvUnsafeArray") != std::string::npos) {
+        error = "array vertex outputs are not supported by GX line/point expansion";
+        return false;
+    }
+    std::string position;
+    std::vector<std::pair<unsigned, std::pair<std::string, std::string>>> texcoords;  // index -> (type, name)
+    std::uint32_t members = 0u;
+    std::size_t at = 0u;
+    while (at < body.size()) {
+        std::size_t line_end = body.find('\n', at);
+        if (line_end == std::string::npos) line_end = body.size();
+        const std::string line = body.substr(at, line_end - at);
+        at = line_end + 1u;
+        const std::size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos) continue;
+        const std::size_t type_end = line.find(' ', first);
+        const std::size_t name_end = line.find_first_of(" ;[", type_end + 1u);
+        if (type_end == std::string::npos || name_end == std::string::npos) continue;
+        ++members;
+        const std::string type = line.substr(first, type_end - first);
+        const std::string name = line.substr(type_end + 1u, name_end - type_end - 1u);
+        if (line.find("[[position]]") != std::string::npos) position = name;
+        const std::size_t locn = line.find("[[user(locn");
+        if (locn != std::string::npos) {
+            const unsigned location = static_cast<unsigned>(std::strtoul(line.c_str() + locn + 11u, nullptr, 10));
+            // TEXCOORD n is location 2 + n (shader_translate.cpp).
+            if (location >= 2u && location < 10u) texcoords.push_back({location - 2u, {type, name}});
+        }
+    }
+    if (position.empty()) {
+        error = "vertex shader writes no position";
+        return false;
+    }
+    stride = std::max<std::uint32_t>(members, 1u) * 16u;  // upper bound of sizeof
+    std::string s;
+    s += "#include <metal_stdlib>\nusing namespace metal;\nstruct GxV {\n" + body + "};\n";
+    s += R"MSL(
+struct GxExpand { uint first; uint indexed; uint wide; int base_vertex; uint strip; uint pad[3]; };
+static GxV gx_fetch(uint k, const device GxV* v, const device uchar* indices, constant GxExpand& p) {
+    const uint i = p.first + k;
+    if (p.indexed != 0u) {
+        const uint index = p.wide != 0u ? ((const device uint*)indices)[i] : uint(((const device ushort*)indices)[i]);
+        return v[int(index) + p.base_vertex];
+    }
+    return v[i];
+}
+vertex GxV gx_expand(uint vid [[vertex_id]], const device GxV* v [[buffer(20)]],
+                     const device uchar* indices [[buffer(21)]], constant GxExpand& p [[buffer(22)]],
+                     constant float4* cb0 [[buffer(0)]]) {
+    const uint prim = vid / 6u;
+    const uint corner = (0x312210u >> ((vid % 6u) * 4u)) & 0xFu;  // strip corners 0,1,2 / 2,1,3
+    const float4 raster = cb0[65];
+    const uint4 tex = as_type<uint4>(cb0[66]);
+)MSL";
+    const std::string pos = "o." + position;
+    if (kind == Expansion::Lines) {
+        s += R"MSL(
+    const uint k = p.strip != 0u ? prim : prim * 2u;
+    const GxV s = gx_fetch(k, v, indices, p);
+    const GxV e = gx_fetch(k + 1u, v, indices, p);
+)MSL";
+        s += "    const float2 delta = abs(e." + position + ".xy / e." + position + ".w - s." + position + ".xy / s." +
+             position + ".w);\n";
+        s += R"MSL(
+    const bool tall = raster.y * delta.y > raster.x * delta.x;
+    const float2 offset = tall ? float2(raster.z / raster.x, 0.0) : float2(0.0, -raster.z / raster.y);
+    GxV o = corner < 2u ? s : e;
+    const bool plus = (corner & 1u) != 0u;
+)MSL";
+        s += "    " + pos + ".xy += (plus ? offset : -offset) * " + pos + ".w;\n";
+        s += "    if (plus && tex.z != 0u) {\n        const float t = 1.0 / float(tex.z);\n";
+        for (const auto& [index, member] : texcoords) {
+            s += "        if ((tex.x & " + std::to_string(1u << index) + "u) != 0u) o." + member.second + ".x += t;\n";
+        }
+        s += "    }\n";
+    } else {
+        s += R"MSL(
+    GxV o = gx_fetch(prim, v, indices, p);
+    const bool right = (corner & 1u) != 0u;
+    const bool bottom = corner >= 2u;
+    const float2 signs = float2(right ? 1.0 : -1.0, bottom ? -1.0 : 1.0);
+)MSL";
+        s += "    " + pos + ".xy += signs * raster.ww / raster.xy * " + pos + ".w;\n";
+        s += "    if (tex.w != 0u) {\n        const float t = 1.0 / float(tex.w);\n";
+        for (const auto& [index, member] : texcoords) {
+            if (member.first == "float" || member.first == "half") continue;
+            s += "        if ((tex.y & " + std::to_string(1u << index) + "u) != 0u) o." + member.second +
+                 ".xy += float2(right ? t : 0.0, bottom ? t : 0.0);\n";
+        }
+        s += "    }\n";
+    }
+    s += "    return o;\n}\n";
+    source = std::move(s);
+    return true;
+}
 
 class MetalPipeline final : public BackendPipeline {
 public:
@@ -316,6 +447,9 @@ public:
     CompiledShader vs;
     CompiledShader ps;
     bool has_ps = false;
+    Expansion expansion = Expansion::None;
+    id<MTLFunction> expand_function;
+    std::uint32_t capture_stride = 0u;
     id<MTLDepthStencilState> depth_state;
     MTLCullMode cull = MTLCullModeNone;
     MTLWinding winding = MTLWindingClockwise;
@@ -407,11 +541,38 @@ public:
                                               uses_second_source(rt.DestBlendAlpha));
         }
         const bool points = info.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
-        if (!compile(*info.vs, xlate::Stage::Vertex, false, points, pipeline->vs, error)) {
+        if (info.has_geometry_shader && (points || info.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE)) {
+            pipeline->expansion = points ? Expansion::Points : Expansion::Lines;
+        }
+        const bool capture = pipeline->expansion != Expansion::None;
+        if (!compile(*info.vs, xlate::Stage::Vertex, false, points && !capture, capture, pipeline->vs, error)) {
             return nullptr;
         }
+        if (capture) {
+            std::string source;
+            if (!expansion_source(pipeline->vs.msl, pipeline->vs.function.name.UTF8String, pipeline->expansion,
+                                  source, pipeline->capture_stride, error)) {
+                error = info.label + ": " + error;
+                return nullptr;
+            }
+            @autoreleasepool {
+                MTLCompileOptions* compile_options = [[MTLCompileOptions alloc] init];
+                compile_options.languageVersion = MTLLanguageVersion2_3;
+                compile_options.fastMathEnabled = NO;
+                NSError* failure = nil;
+                id<MTLLibrary> library = [device_ newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
+                                                               options:compile_options
+                                                                 error:&failure];
+                if (library == nil) {
+                    error = info.label + ": expansion: " +
+                            (failure != nil ? std::string([[failure localizedDescription] UTF8String]) : "?");
+                    return nullptr;
+                }
+                pipeline->expand_function = [library newFunctionWithName:@"gx_expand"];
+            }
+        }
         if (info.ps && !info.ps->spirv.empty()) {
-            if (!compile(*info.ps, xlate::Stage::Pixel, dual_source, false, pipeline->ps, error)) {
+            if (!compile(*info.ps, xlate::Stage::Pixel, dual_source, false, false, pipeline->ps, error)) {
                 return nullptr;
             }
             pipeline->has_ps = true;
@@ -440,7 +601,7 @@ public:
                                                                : MTLDepthClipModeClamp;
         // Build the stride-independent variant now when the layout has no
         // vertex buffers, so errors surface at creation as on D3D12.
-        if (info.input_layout.empty()) {
+        if (info.input_layout.empty() || capture) {
             if (render_state(*pipeline, {}, error) == nil) return nullptr;
         }
         return pipeline;
@@ -503,11 +664,12 @@ private:
     friend class Encoder;
 
     // ----- Shader compilation ---------------------------------------------
-    bool compile(const ShaderProgram& program, xlate::Stage stage, bool dual_source, bool points,
+    bool compile(const ShaderProgram& program, xlate::Stage stage, bool dual_source, bool points, bool capture,
                  CompiledShader& out, std::string& error) {
         const std::uint64_t key = hash_words(program.spirv, (dual_source ? 1u : 0u) |
                                                                 (points ? 2u : 0u) |
-                                                                (stage == xlate::Stage::Pixel ? 4u : 0u));
+                                                                (stage == xlate::Stage::Pixel ? 4u : 0u) |
+                                                                (capture ? 8u : 0u));
         {
             const std::lock_guard<std::mutex> lock(library_mutex_);
             auto found = functions_.find(key);
@@ -521,6 +683,7 @@ private:
         options.label = program.label;
         options.dual_source_blend = dual_source;
         options.points = points;
+        options.capture_output = capture;
 #if TARGET_OS_IPHONE
         options.platform = xlate::Platform::iOS;
 #else
@@ -552,6 +715,7 @@ private:
             }
         }
         out.vertex_inputs = msl.vertex_inputs;
+        if (capture) out.msl = msl.msl;
         const std::lock_guard<std::mutex> lock(library_mutex_);
         functions_.emplace(key, out);
         return true;
@@ -559,11 +723,18 @@ private:
 
     // ----- Render pipeline variants -----------------------------------------
     // `strides`: per vertex slot, from the bound vertex buffer views.
+    // With an expansion, `capture` selects the capture pass's state (the
+    // vertex shader alone, rasterization off); otherwise the expansion pass's
+    // (no vertex layout, so strides do not matter).
     id<MTLRenderPipelineState> render_state(MetalPipeline& pipeline,
                                             const std::array<std::uint32_t, 8>& strides,
-                                            std::string& error) {
+                                            std::string& error, bool capture = false) {
+        const bool expanded = pipeline.expansion != Expansion::None;
         std::uint64_t key = 0u;
-        for (unsigned slot = 0; slot < 8u; ++slot) key = key * 1315423911u + strides[slot];
+        if (!expanded || capture) {
+            for (unsigned slot = 0; slot < 8u; ++slot) key = key * 1315423911u + strides[slot];
+        }
+        if (capture) key = (key << 1u) | 1u;
         {
             const std::lock_guard<std::mutex> lock(pipeline.mutex);
             auto found = pipeline.states.find(key);
@@ -571,14 +742,18 @@ private:
         }
         const GraphicsPipelineInfo& info = pipeline.info;
         MTLRenderPipelineDescriptor* d = [[MTLRenderPipelineDescriptor alloc] init];
-        d.vertexFunction = pipeline.vs.function;
-        if (pipeline.has_ps) d.fragmentFunction = pipeline.ps.function;
+        d.vertexFunction = expanded && !capture ? pipeline.expand_function : pipeline.vs.function;
+        if (pipeline.has_ps && !capture) d.fragmentFunction = pipeline.ps.function;
+        if (capture) d.rasterizationEnabled = NO;
         d.rasterSampleCount = std::max<UINT>(info.sample.Count, 1u);
-        d.alphaToCoverageEnabled = info.blend.AlphaToCoverageEnable ? YES : NO;
+        d.alphaToCoverageEnabled = info.blend.AlphaToCoverageEnable && !capture ? YES : NO;
         switch (info.topology_type) {
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT: d.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE: d.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine; break;
         default: d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle; break;
+        }
+        if (expanded) {
+            d.inputPrimitiveTopology = capture ? MTLPrimitiveTopologyClassPoint : MTLPrimitiveTopologyClassTriangle;
         }
         for (UINT i = 0; i < info.num_render_targets && i < 8u; ++i) {
             const MTLPixelFormat format = pixel_format(info.rtv_formats[i]);
@@ -610,7 +785,7 @@ private:
         }
         // Vertex layout: input elements by semantic onto the shader's
         // attributes; buffer slots count down from kVertexBufferBase.
-        if (!info.input_layout.empty()) {
+        if (!info.input_layout.empty() && (!expanded || capture)) {
             MTLVertexDescriptor* vertex = [MTLVertexDescriptor vertexDescriptor];
             std::array<bool, 8> used{};
             for (const InputElement& e : info.input_layout) {
@@ -943,6 +1118,10 @@ fragment DepthOut depth_from_buffer(Fullscreen in [[stage_in]], const device uin
             for (const InputElement& e : pipeline->info.input_layout) {
                 if (e.input_slot < 8u) strides[e.input_slot] = vertex_buffers_[e.input_slot].StrideInBytes;
             }
+            if (pipeline->expansion != Expansion::None) {
+                draw_expanded(c, *pipeline, strides);
+                return;
+            }
             if (pipeline_dirty_ || pipeline != bound_pipeline_ || strides != bound_strides_) {
                 std::string error;
                 id<MTLRenderPipelineState> state = backend_.render_state(*pipeline, strides, error);
@@ -994,6 +1173,100 @@ fragment DepthOut depth_from_buffer(Fullscreen in [[stage_in]], const device uin
                               baseInstance:c.first_instance];
         }
 
+        void set_pipeline_state(MetalPipeline& pipeline, id<MTLRenderPipelineState> state) {
+            [render_ setRenderPipelineState:state];
+            [render_ setDepthStencilState:pipeline.depth_state];
+            [render_ setCullMode:pipeline.cull];
+            [render_ setFrontFacingWinding:pipeline.winding];
+            [render_ setTriangleFillMode:pipeline.fill];
+            [render_ setDepthClipMode:pipeline.depth_clip];
+            const auto& raster = pipeline.info.rasterizer;
+            [render_ setDepthBias:static_cast<float>(raster.DepthBias) / 16777215.0f
+                       slopeScale:raster.SlopeScaledDepthBias
+                            clamp:raster.DepthBiasClamp];
+        }
+
+        // GX wide lines/points (see Expansion): capture the vertex shader's
+        // outputs, then draw the expanded quads.
+        void draw_expanded(const cmd::Draw& c, MetalPipeline& pipeline, const std::array<std::uint32_t, 8>& strides) {
+            const bool lines = pipeline.expansion == Expansion::Lines;
+            const bool strip = topology_ == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
+            const std::uint32_t primitives = lines ? (strip ? (c.count >= 2u ? c.count - 1u : 0u) : c.count / 2u)
+                                                   : c.count;
+            if (primitives == 0u) return;
+            // Vertices to capture: all the draw can reference.
+            std::uint64_t vertices = std::uint64_t{c.first} + c.count;
+            if (c.indexed) {
+                vertices = UINT32_MAX;
+                for (const InputElement& e : pipeline.info.input_layout) {
+                    if (e.input_slot >= 8u || e.classification != D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA) continue;
+                    const D3D12_VERTEX_BUFFER_VIEW& view = vertex_buffers_[e.input_slot];
+                    if (view.StrideInBytes == 0u) continue;
+                    vertices = std::min<std::uint64_t>(vertices, view.SizeInBytes / view.StrideInBytes);
+                }
+                if (vertices == UINT32_MAX) vertices = 65536u;
+            }
+            if (vertices == 0u) return;
+            MetalBuffer* indices = nullptr;
+            std::uint64_t index_offset = 0u;
+            if (c.indexed) {
+                const auto [resource, offset] = AddressSpace::instance().find(index_buffer_.BufferLocation);
+                indices = buffer_of(resource);
+                index_offset = offset;
+                if (indices == nullptr) return;
+            }
+            std::string error;
+            id<MTLRenderPipelineState> capture = backend_.render_state(pipeline, strides, error, true);
+            id<MTLRenderPipelineState> expand = capture != nil ? backend_.render_state(pipeline, strides, error) : nil;
+            if (capture == nil || expand == nil) {
+                report("pipeline", error);
+                return;
+            }
+            id<MTLDevice> device = backend_.device_;
+            id<MTLBuffer> captured = [device newBufferWithLength:vertices * pipeline.capture_stride
+                                                         options:MTLResourceStorageModePrivate];
+            const std::uint32_t params[4]{static_cast<std::uint32_t>(vertices), 0u, 0u, 0u};
+            id<MTLBuffer> capture_params = [device newBufferWithBytes:params length:sizeof(params)
+                                                              options:MTLResourceStorageModeShared];
+            if (captured == nil || capture_params == nil) return;
+
+            // Capture pass.
+            set_pipeline_state(pipeline, capture);
+            if (viewport_dirty_) apply_viewport();
+            apply_bindings();
+            apply_vertex_buffers();
+            [render_ setVertexBuffer:captured offset:0 atIndex:kExpandCapturedIndex];
+            [render_ setVertexBuffer:capture_params offset:0 atIndex:xlate::kCaptureParamsIndex];
+            [render_ drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:vertices];
+            // The expansion reads the captured outputs in its vertex stage: a
+            // new pass orders it after the capture.
+            end_render();
+            if (!begin_render()) return;
+
+            set_pipeline_state(pipeline, expand);
+            apply_viewport();
+            [render_ setBlendColorRed:blend_factor_[0] green:blend_factor_[1] blue:blend_factor_[2] alpha:blend_factor_[3]];
+            [render_ setStencilReferenceValue:stencil_ref_];
+            apply_bindings();
+            [render_ setVertexBuffer:captured offset:0 atIndex:kExpandCapturedIndex];
+            if (indices != nullptr) {
+                [render_ setVertexBuffer:indices->buffer() offset:index_offset atIndex:kExpandIndicesIndex];
+            } else {
+                [render_ setVertexBuffer:capture_params offset:0 atIndex:kExpandIndicesIndex];  // unused
+            }
+            const ExpandParams expand_params{c.first, c.indexed ? 1u : 0u,
+                                             index_buffer_.Format == DXGI_FORMAT_R32_UINT ? 1u : 0u,
+                                             c.indexed ? c.base_vertex : 0, strip ? 1u : 0u, {}};
+            [render_ setVertexBytes:&expand_params length:sizeof(expand_params) atIndex:kExpandParamsIndex];
+            [render_ drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:std::uint64_t{primitives} * 6u];
+            // The next ordinary draw rebinds everything.
+            bound_pipeline_ = nullptr;
+            pipeline_dirty_ = true;
+            dynamic_dirty_ = true;
+            vertex_dirty_ = true;
+            bindings_dirty_ = true;
+        }
+
         void apply_viewport() {
             if (has_viewport_) {
                 MTLViewport v{viewport_.TopLeftX, viewport_.TopLeftY, viewport_.Width,
@@ -1017,7 +1290,8 @@ fragment DepthOut depth_from_buffer(Fullscreen in [[stage_in]], const device uin
             const auto [resource, offset] = AddressSpace::instance().find(address);
             MetalBuffer* buffer = buffer_of(resource);
             if (buffer == nullptr) return;
-            if (visibility == D3D12_SHADER_VISIBILITY_ALL || visibility == D3D12_SHADER_VISIBILITY_VERTEX) {
+            if (visibility == D3D12_SHADER_VISIBILITY_ALL || visibility == D3D12_SHADER_VISIBILITY_VERTEX ||
+                visibility == D3D12_SHADER_VISIBILITY_GEOMETRY) {
                 [render_ setVertexBuffer:buffer->buffer() offset:offset atIndex:index];
             }
             if (visibility == D3D12_SHADER_VISIBILITY_ALL || visibility == D3D12_SHADER_VISIBILITY_PIXEL) {
@@ -1025,7 +1299,8 @@ fragment DepthOut depth_from_buffer(Fullscreen in [[stage_in]], const device uin
             }
         }
         void bind_texture(D3D12_SHADER_VISIBILITY visibility, NSUInteger index, id<MTLTexture> texture) {
-            if (visibility == D3D12_SHADER_VISIBILITY_ALL || visibility == D3D12_SHADER_VISIBILITY_VERTEX) {
+            if (visibility == D3D12_SHADER_VISIBILITY_ALL || visibility == D3D12_SHADER_VISIBILITY_VERTEX ||
+                visibility == D3D12_SHADER_VISIBILITY_GEOMETRY) {
                 [render_ setVertexTexture:texture atIndex:index];
             }
             if (visibility == D3D12_SHADER_VISIBILITY_ALL || visibility == D3D12_SHADER_VISIBILITY_PIXEL) {
@@ -1033,7 +1308,8 @@ fragment DepthOut depth_from_buffer(Fullscreen in [[stage_in]], const device uin
             }
         }
         void bind_sampler(D3D12_SHADER_VISIBILITY visibility, NSUInteger index, id<MTLSamplerState> state) {
-            if (visibility == D3D12_SHADER_VISIBILITY_ALL || visibility == D3D12_SHADER_VISIBILITY_VERTEX) {
+            if (visibility == D3D12_SHADER_VISIBILITY_ALL || visibility == D3D12_SHADER_VISIBILITY_VERTEX ||
+                visibility == D3D12_SHADER_VISIBILITY_GEOMETRY) {
                 [render_ setVertexSamplerState:state atIndex:index];
             }
             if (visibility == D3D12_SHADER_VISIBILITY_ALL || visibility == D3D12_SHADER_VISIBILITY_PIXEL) {
@@ -1098,7 +1374,8 @@ fragment DepthOut depth_from_buffer(Fullscreen in [[stage_in]], const device uin
                     values.resize(std::max<std::size_t>(p.num_constants, 1u));
                     const NSUInteger slot = buffer_index(p.shader_register, p.space);
                     const NSUInteger bytes = values.size() * sizeof(std::uint32_t);
-                    if (p.visibility == D3D12_SHADER_VISIBILITY_ALL || p.visibility == D3D12_SHADER_VISIBILITY_VERTEX) {
+                    if (p.visibility == D3D12_SHADER_VISIBILITY_ALL || p.visibility == D3D12_SHADER_VISIBILITY_VERTEX ||
+                        p.visibility == D3D12_SHADER_VISIBILITY_GEOMETRY) {
                         [render_ setVertexBytes:values.data() length:bytes atIndex:slot];
                     }
                     if (p.visibility == D3D12_SHADER_VISIBILITY_ALL || p.visibility == D3D12_SHADER_VISIBILITY_PIXEL) {

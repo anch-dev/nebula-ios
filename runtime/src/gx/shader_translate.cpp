@@ -172,6 +172,11 @@ Result spirv_to_msl(std::span<const std::uint32_t> words, Stage stage, const Opt
         msl_options.enable_point_size_builtin = options.points;
         msl_options.enable_point_size_default = options.points;
         msl_options.default_point_size = 1.0f;
+        if (options.capture_output && stage == Stage::Vertex) {
+            msl_options.capture_output_to_buffer = true;
+            msl_options.shader_output_buffer_index = kCaptureOutputIndex;
+            msl_options.indirect_params_buffer_index = kCaptureParamsIndex;
+        }
         msl.set_msl_options(msl_options);
         spirv_cross::CompilerGLSL::Options common = msl.get_common_options();
         common.vertex.flip_vert_y = false;  // D3D and Metal share clip space
