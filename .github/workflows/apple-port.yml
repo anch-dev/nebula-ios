@@ -64,7 +64,9 @@ jobs:
         run: cmake --build build-ios 2>&1 | tee build-ios.log; exit ${PIPESTATUS[0]}
       - name: Surface errors
         if: failure()
-        run: grep -E "error|Error" build-ios.log | head -40 | sed 's/^/::error::/' || true
+        run: |
+          { grep -E "error|Error" build-ios.log | head -30;
+            grep -E -A25 "Undefined symbols|duplicate symbol" build-ios.log | head -60; } | sed 's/^/::error::/' || true
       # What a PC needs to compile the game modules for iOS (docs/APPLE_PORT.md
       # step 8): runtime headers and libraries, and the iOS SDK headers and
       # link stubs they need.
