@@ -85,7 +85,7 @@ jobs:
           try {
             ./tools/ios/build-modules.ps1 -Generated tools/ios/test/fake-generated -Sdk nebula-ios-module-sdk -Llvm "$(brew --prefix llvm)/bin" -Out module-test *>&1 | Tee-Object -FilePath modules.log
           } catch {
-            Get-Content modules.log -Tail 40 | ForEach-Object { "::error::$_" }
+            Select-String -Path modules.log -Pattern 'error' | Select-Object -First 15 | ForEach-Object { "::error::$($_.Line)" }
             throw
           }
           foreach ($m in 'RMGE01_game', 'RMGE01_home_button', 'RMGE01_dsp') {
@@ -129,14 +129,17 @@ jobs:
           $env:GALAXY_MULTI_GPR_CPP_FIXTURE = "$PWD\tools\ios\test\fake-generated\game\functions_0000.cpp"
           cargo test --release --locked -p nebula-recomp-core multi_register_public_cpp_fixture
           if (-not (Test-Path $env:GALAXY_MULTI_GPR_CPP_FIXTURE)) { throw 'no fixture written' }
+      # The runner's LLVM can be older than the 19+ the guide asks for.
+      - name: Install current LLVM
+        run: choco upgrade llvm -y --no-progress
       - name: Build the test modules with build-modules.ps1
         shell: pwsh
         run: |
-          & "C:\Program Files\LLVM\bin\clang++.exe" --version
+          & "C:\Program Files\LLVM\bin\clang++.exe" --version | Select-Object -First 1 | ForEach-Object { "::notice::$_" }
           try {
             ./tools/ios/build-modules.ps1 -Generated tools/ios/test/fake-generated -Sdk nebula-ios-module-sdk -Out module-test *>&1 | Tee-Object -FilePath modules.log
           } catch {
-            Get-Content modules.log -Tail 40 | ForEach-Object { "::error::$_" }
+            Select-String -Path modules.log -Pattern 'error' | Select-Object -First 15 | ForEach-Object { "::error::$($_.Line)" }
             throw
           }
           & "C:\Program Files\LLVM\bin\llvm-nm.exe" -gU module-test/Frameworks/RMGE01_game.framework/RMGE01_game

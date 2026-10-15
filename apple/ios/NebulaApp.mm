@@ -18,6 +18,7 @@
 // which the Files app shows under On My iPhone > Nebula.
 
 #import <AVFoundation/AVFoundation.h>
+#import <CoreHaptics/CoreHaptics.h>
 #import <GameController/GameController.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <UIKit/UIKit.h>
@@ -125,6 +126,76 @@ std::int16_t axis(float value) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Vibration: the motor strength the runtime asks of a pad slot
+// (host_platform::pad_rumble), played as continuous haptics on a
+// controller, or on the phone itself for the touch pad.
+// ---------------------------------------------------------------------------
+@interface NBRumble : NSObject
+- (instancetype)initWithEngine:(CHHapticEngine*)engine slot:(unsigned)slot;
+- (void)update;
+- (void)stop;
+@end
+
+@implementation NBRumble {
+    CHHapticEngine* _engine;
+    id<CHHapticAdvancedPatternPlayer> _player;
+    unsigned _slot;
+    float _level;
+    bool _playing;
+}
+
+- (instancetype)initWithEngine:(CHHapticEngine*)engine slot:(unsigned)slot {
+    self = [super init];
+    if (self == nil || engine == nil) return nil;
+    _engine = engine;
+    _slot = slot;
+    _engine.playsHapticsOnly = YES;
+    _engine.autoShutdownEnabled = YES;
+    NSError* error = nil;
+    if (![_engine startAndReturnError:&error]) return nil;
+    CHHapticEvent* event = [[CHHapticEvent alloc]
+        initWithEventType:CHHapticEventTypeHapticContinuous
+               parameters:@[ [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:1.0f],
+                             [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticSharpness value:0.3f] ]
+             relativeTime:0
+                 duration:30.0];
+    CHHapticPattern* pattern = [[CHHapticPattern alloc] initWithEvents:@[ event ] parameters:@[] error:&error];
+    _player = pattern != nil ? [_engine createAdvancedPlayerWithPattern:pattern error:&error] : nil;
+    if (_player == nil) return nil;
+    _player.loopEnabled = YES;
+    return self;
+}
+
+- (void)update {
+    const hp::PadRumble rumble = hp::pad_rumble(_slot);
+    const float level = static_cast<float>(std::max(rumble.left_motor, rumble.right_motor)) / 65535.0f;
+    if (std::fabs(level - _level) < 0.01f) return;
+    _level = level;
+    if (level <= 0.0f) {
+        if (_playing) [_player stopAtTime:CHHapticTimeImmediate error:nil];
+        _playing = false;
+        return;
+    }
+    if (!_playing) {
+        [_engine startAndReturnError:nil];
+        _playing = [_player startAtTime:CHHapticTimeImmediate error:nil];
+    }
+    [_player sendParameters:@[ [[CHHapticDynamicParameter alloc]
+                                initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl
+                                              value:level
+                                       relativeTime:0] ]
+                     atTime:CHHapticTimeImmediate
+                      error:nil];
+}
+
+- (void)stop {
+    if (_playing) [_player stopAtTime:CHHapticTimeImmediate error:nil];
+    _playing = false;
+    _level = 0.0f;
+}
+@end
 
 // ---------------------------------------------------------------------------
 // The game view: a CAMetalLayer the Metal renderer presents into.
@@ -400,6 +471,8 @@ static void* game_thread(void* context);
     bool _started;
     bool _active;
     NSMutableArray<GCController*>* _controllers;
+    NSMutableArray<NBRumble*>* _rumbles;
+    CADisplayLink* _rumbleLink;
 }
 
 - (void)loadView {
@@ -429,6 +502,7 @@ static void* game_thread(void* context);
     [_gameView addSubview:_message];
 
     _controllers = [NSMutableArray array];
+    _rumbles = [NSMutableArray array];
     _active = true;
 }
 
@@ -441,6 +515,9 @@ static void* game_thread(void* context);
     [center addObserver:self selector:@selector(becameActive) name:UIApplicationDidBecomeActiveNotification object:nil];
     [center addObserver:self selector:@selector(resignedActive) name:UIApplicationWillResignActiveNotification object:nil];
     [self controllersChanged];
+    _rumbleLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(updateRumble)];
+    _rumbleLink.preferredFrameRateRange = CAFrameRateRangeMake(30, 60, 60);
+    [_rumbleLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     if (GCKeyboard.coalescedKeyboard != nil) [self attachKeyboard:GCKeyboard.coalescedKeyboard];
     publish_touch_pad();
 }
@@ -494,6 +571,7 @@ static void* game_thread(void* context);
 
 - (void)resignedActive {
     _active = false;
+    for (NBRumble* rumble in _rumbles) [rumble stop];
     [self publishWindow];
 }
 
@@ -581,7 +659,13 @@ static void* game_thread(void* context) {
 }
 
 // ----- Controllers -----------------------------------------------------------
+- (void)updateRumble {
+    for (NBRumble* rumble in _rumbles) [rumble update];
+}
+
 - (void)controllersChanged {
+    for (NBRumble* rumble in _rumbles) [rumble stop];
+    [_rumbles removeAllObjects];
     [_controllers removeAllObjects];
     for (GCController* controller in GCController.controllers) {
         if (controller.extendedGamepad != nil && _controllers.count < 4) [_controllers addObject:controller];
@@ -606,6 +690,16 @@ static void* game_thread(void* context) {
             hp::set_pad(this_slot, [NBGameViewController padState:pad]);
         };
         hp::set_pad(this_slot, [NBGameViewController padState:controller.extendedGamepad]);
+        if (NBRumble* rumble = [[NBRumble alloc] initWithEngine:[controller.haptics createEngineWithLocality:GCHapticsLocalityDefault]
+                                                           slot:this_slot]) {
+            [_rumbles addObject:rumble];
+        }
+    }
+    // The touch pad vibrates the phone.
+    if (_controllers.count == 0 && CHHapticEngine.capabilitiesForHardware.supportsHaptics) {
+        if (NBRumble* rumble = [[NBRumble alloc] initWithEngine:[[CHHapticEngine alloc] initAndReturnError:nil] slot:0u]) {
+            [_rumbles addObject:rumble];
+        }
     }
 }
 

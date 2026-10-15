@@ -523,7 +523,8 @@ if(GALAXY_SHADER_TRANSLATOR)
         target_compile_options(Nebula PRIVATE -fobjc-arc)
         target_link_libraries(Nebula PRIVATE galaxy_native_runtime
             "-framework UIKit" "-framework GameController" "-framework AVFoundation"
-            "-framework QuartzCore" "-framework Metal" "-framework CoreGraphics" "-framework Foundation")
+            "-framework QuartzCore" "-framework Metal" "-framework CoreGraphics" "-framework CoreHaptics"
+            "-framework Foundation")
         set_target_properties(Nebula PROPERTIES
             MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/apple/ios/Info.plist.in"
             MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.nebula.ios"
