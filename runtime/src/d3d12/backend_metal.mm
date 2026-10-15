@@ -746,7 +746,7 @@ fragment ClearOut clear_fs(Fullscreen in [[stage_in]], constant ClearValues& v [
 
     id<MTLDepthStencilState> depth_state(bool write) {
         const std::lock_guard<std::mutex> lock(clear_mutex_);
-        id<MTLDepthStencilState>& state = write ? depth_write_always_ : depth_disabled_;
+        __strong id<MTLDepthStencilState>& state = write ? depth_write_always_ : depth_disabled_;
         if (state == nil) {
             MTLDepthStencilDescriptor* d = [[MTLDepthStencilDescriptor alloc] init];
             d.depthCompareFunction = MTLCompareFunctionAlways;
