@@ -21,7 +21,10 @@ jobs:
         run: ctest --test-dir build --output-on-failure 2>&1 | tee test.log; exit ${PIPESTATUS[0]}
       - name: Surface errors
         if: failure()
-        run: cat build.log test.log 2>/dev/null | grep -E "error|FAILED|Failed" | head -40 | sed 's/^/::error::/' || true
+        run: |
+          { grep -A40 "The following tests FAILED" test.log 2>/dev/null;
+            grep -E "error:" build.log 2>/dev/null | head -20;
+            grep -E "FAILED|Failed" test.log 2>/dev/null | sort | uniq -c | sort -rn | head -40; } | sed 's/^/::error::/' || true
 
   macos-arm64:
     name: macOS Apple Silicon (build + tests)
@@ -38,7 +41,10 @@ jobs:
         run: ctest --test-dir build --output-on-failure 2>&1 | tee test.log; exit ${PIPESTATUS[0]}
       - name: Surface errors
         if: failure()
-        run: cat build.log test.log 2>/dev/null | grep -E "error|FAILED|Failed" | head -40 | sed 's/^/::error::/' || true
+        run: |
+          { grep -A40 "The following tests FAILED" test.log 2>/dev/null;
+            grep -E "error:" build.log 2>/dev/null | head -20;
+            grep -E "FAILED|Failed" test.log 2>/dev/null | sort | uniq -c | sort -rn | head -40; } | sed 's/^/::error::/' || true
 
   ios-arm64:
     name: iOS arm64 (compile only)
