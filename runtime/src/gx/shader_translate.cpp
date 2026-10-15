@@ -169,6 +169,9 @@ Result spirv_to_msl(std::span<const std::uint32_t> words, Stage stage, const Opt
             : spirv_cross::CompilerMSL::Options::macOS;
         msl_options.set_msl_version(2, 3);
         msl_options.pad_fragment_output_components = true;
+        msl_options.enable_point_size_builtin = options.points;
+        msl_options.enable_point_size_default = options.points;
+        msl_options.default_point_size = 1.0f;
         msl.set_msl_options(msl_options);
         spirv_cross::CompilerGLSL::Options common = msl.get_common_options();
         common.vertex.flip_vert_y = false;  // D3D and Metal share clip space

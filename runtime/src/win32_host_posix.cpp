@@ -185,6 +185,11 @@ void set_window(void* view, int width, int height, bool visible, bool focused) {
     }
 }
 
+void* current_view() {
+    const std::lock_guard<std::mutex> lock(state().mutex);
+    return state().view;
+}
+
 void set_screen(int width, int height, unsigned refresh_hz, float scale) {
     const std::lock_guard<std::mutex> lock(state().mutex);
     state().screen_width = width;

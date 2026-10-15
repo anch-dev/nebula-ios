@@ -50,6 +50,9 @@ struct Options {
     // blending (Metal: [[color(0), index(1)]]), not a second render target.
     bool dual_source_blend = false;
     Platform platform = Platform::iOS;
+    // Vertex shaders drawn as points: write [[point_size]] (default 1)
+    // when the shader does not, as Metal requires.
+    bool points = false;
     // Name for diagnostics.
     std::string label;
 };

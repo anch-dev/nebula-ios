@@ -439,6 +439,16 @@ if(GALAXY_SHADER_TRANSLATOR)
     target_include_directories(galaxy_d3d12 PUBLIC ${galaxy_d3d12_includes})
     target_link_libraries(galaxy_d3d12 PUBLIC galaxy_shader_translate galaxy_win32_posix
         Threads::Threads)
+    if(APPLE)
+        enable_language(OBJCXX)
+        set(GALAXY_METAL_BACKEND ON)
+        target_sources(galaxy_d3d12 PRIVATE runtime/src/d3d12/backend_metal.mm)
+        set_source_files_properties(runtime/src/d3d12/backend_metal.mm
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_compile_definitions(galaxy_d3d12 PRIVATE GALAXY_METAL_BACKEND=1)
+        target_link_libraries(galaxy_d3d12 PUBLIC
+            "-framework Metal" "-framework QuartzCore" "-framework Foundation")
+    endif()
 
     set(galaxy_gx_sources
         runtime/src/gx/gx_shim.cpp
@@ -527,4 +537,9 @@ if(GALAXY_SHADER_TRANSLATOR)
         add_test(NAME pipeline_cache_persistence_tests
             COMMAND galaxy_pipeline_cache_persistence_tests)
     endif()
+endif()
+
+if(GALAXY_SHADER_TRANSLATOR)
+    galaxy_portable_test(d3d12_layer_tests SOURCES runtime/src/d3d12/d3d12_layer_tests.cpp
+        LIBS galaxy_d3d12)
 endif()

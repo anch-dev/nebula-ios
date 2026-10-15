@@ -20,6 +20,9 @@ namespace galaxy::host_platform {
 // WM_SETFOCUS/WM_KILLFOCUS and WM_ACTIVATEAPP, as on Windows.
 void set_window(void* view, int width, int height, bool visible, bool focused);
 
+// The view last passed to set_window (null when none), for the renderer.
+void* current_view();
+
 // The screen the view is on: size in pixels, refresh rate, and points to
 // pixels scale (DPI = 96 x scale). Unset: the view's size, 60 Hz, 1x.
 void set_screen(int width, int height, unsigned refresh_hz, float scale);
