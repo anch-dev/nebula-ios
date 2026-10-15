@@ -38,6 +38,7 @@
 #include "galaxy/win32_host_posix.h"
 #include "galaxy/windows_power.h"
 #include "galaxy/portable_hash.h"
+#include "galaxy/native_module_path.h"
 #endif
 
 #include <algorithm>
@@ -15923,7 +15924,11 @@ const GeneratedDsp& generated_dsp() {
         }
         path.resize(length);
         path.resize(path.find_last_of(L"\\/") + 1u);
+#if defined(_WIN32)
         path += L"RMGE01_dsp.dll";
+#else
+        path = galaxy::native_module_path(std::filesystem::path(path), "RMGE01_dsp").wstring();
+#endif
         const HMODULE module = LoadLibraryExW(
             path.c_str(), nullptr,
             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);

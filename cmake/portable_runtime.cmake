@@ -102,6 +102,10 @@ endif()
 add_library(galaxy_native_host STATIC ${galaxy_native_host_sources})
 target_include_directories(galaxy_native_host PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src")
 target_link_libraries(galaxy_native_host PUBLIC ${galaxy_native_host_libraries})
+# As in the Windows product build (NEBULA_DSP_MODULE), the DSP is the
+# RMGE01_dsp module compiled from the user's game, loaded at run time. (The
+# test-support variant keeps upstream's test configuration.)
+target_compile_definitions(galaxy_native_host PRIVATE GALAXY_HAVE_NATIVE_DSP=1 GALAXY_NATIVE_DSP_MODULE=1)
 # Test-support variant, as on Windows (retired DSP mixer helpers, fault hooks).
 add_library(galaxy_native_host_test_support STATIC ${galaxy_native_host_sources})
 target_include_directories(galaxy_native_host_test_support PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/src")

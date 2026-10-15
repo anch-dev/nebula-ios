@@ -65,6 +65,62 @@ jobs:
       - name: Surface errors
         if: failure()
         run: grep -E "error|Error" build-ios.log | head -40 | sed 's/^/::error::/' || true
+      # What a PC needs to compile the game modules for iOS (docs/APPLE_PORT.md
+      # step 8): runtime headers and libraries, and the iOS SDK headers and
+      # link stubs they need.
+      - name: Package the module SDK
+        run: |
+          brew install llvm lld
+          PROBE_CLANG="$(brew --prefix llvm)/bin/clang++" tools/ios/package-module-sdk.sh build-ios nebula-ios-module-sdk
+      - name: Check the module SDK with LLVM clang and ld64.lld, as on a PC
+        shell: pwsh
+        run: |
+          $env:PATH = "$(brew --prefix lld)/bin:" + $env:PATH
+          ./tools/ios/build-modules.ps1 -Generated tools/ios/test/fake-generated -Sdk nebula-ios-module-sdk -Llvm "$(brew --prefix llvm)/bin" -Out module-test
+          foreach ($m in 'RMGE01_game', 'RMGE01_home_button', 'RMGE01_dsp') {
+            xcrun vtool -show-build "module-test/Frameworks/$m.framework/$m"
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nebula-ios-module-sdk
+          path: nebula-ios-module-sdk
+
+  ios-module-kit:
+    name: iOS module kit (build check on Windows, as on the user's PC)
+    runs-on: windows-2022
+    needs: ios-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: nebula-ios-module-sdk
+          path: nebula-ios-module-sdk
+      - name: Build nebula-recomp
+        run: cargo build --release --locked -p nebula-recomp
+      - name: Add real recompiler output (public synthetic code) to the test tree
+        shell: pwsh
+        run: |
+          $env:GALAXY_MULTI_GPR_CPP_FIXTURE = "$PWD\tools\ios\test\fake-generated\game\functions_0000.cpp"
+          cargo test --release --locked -p nebula-recomp-core multi_register_public_cpp_fixture
+          if (-not (Test-Path $env:GALAXY_MULTI_GPR_CPP_FIXTURE)) { throw 'no fixture written' }
+      - name: Build the test modules with build-modules.ps1
+        shell: pwsh
+        run: |
+          & "C:\Program Files\LLVM\bin\clang++.exe" --version
+          ./tools/ios/build-modules.ps1 -Generated tools/ios/test/fake-generated -Sdk nebula-ios-module-sdk -Out module-test
+          & "C:\Program Files\LLVM\bin\llvm-nm.exe" -gU module-test/Frameworks/RMGE01_game.framework/RMGE01_game
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Package the PC kit
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory kit | Out-Null
+          Copy-Item target/release/nebula-recomp.exe, tools/ios/build-modules.ps1 kit/
+          Copy-Item -Recurse nebula-ios-module-sdk kit/nebula-ios-module-sdk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nebula-ios-pc-kit
+          path: kit
 
   windows-x64:
     name: Windows x64 (MSVC build + tests, regression check)

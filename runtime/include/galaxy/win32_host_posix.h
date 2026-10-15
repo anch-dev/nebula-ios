@@ -63,6 +63,7 @@ FARPROC GetProcAddress(HMODULE module, const char* name) noexcept;
 BOOL FreeLibrary(HMODULE module) noexcept;
 // Search-path flags are accepted and ignored: a full path is loaded as given.
 inline constexpr DWORD LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR = 0x00000100u;
+inline constexpr DWORD LOAD_LIBRARY_SEARCH_DEFAULT_DIRS = 0x00001000u;
 inline constexpr DWORD LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800u;
 HMODULE LoadLibraryExW(const wchar_t* name, HANDLE reserved, DWORD flags) noexcept;
 // std::filesystem::path::c_str() is narrow on POSIX.

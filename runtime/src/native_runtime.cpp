@@ -4,6 +4,7 @@
 #include "galaxy/checkpoint_gate.h"
 #include "galaxy/decrementer_deadline.h"
 #include "galaxy/external_dispatch.h"
+#include "galaxy/native_module_path.h"
 #include "galaxy/site_hooks.h"
 #include "galaxy/coop_scheduler.h"
 #include "galaxy/native_call_admission.h"
@@ -32360,7 +32361,7 @@ static RuntimeLaunchPaths default_runtime_launch_paths() {
     paths.module_path = get_env_path_w(L"GALAXY_MODULE_PATH");
     if (paths.module_path.empty()) {
         const std::filesystem::path sidecar_module =
-            exe_dir / native_module_file("RMGE01_game");
+            galaxy::native_module_path(exe_dir, "RMGE01_game");
         const std::array module_candidates{
             sidecar_module,
             repo_root / "generated" / "native-module-proof-build" /
@@ -33411,7 +33412,7 @@ static int runtime_wmain(int argc, wchar_t** argv) {
     // contract. It carries initialized section bytes plus the BSS clear range;
     // no PPC instruction is decoded, interpreted, or compiled here.
     const std::filesystem::path boot_image_path =
-        abs_module_path.parent_path() / L"RMGE01_boot_image.bin";
+        galaxy::native_module_sidecar_dir(abs_module_path) / L"RMGE01_boot_image.bin";
     galaxy::host::BootImage boot_image;
     try {
         boot_image = galaxy::host::read_boot_image(boot_image_path);
@@ -33454,7 +33455,8 @@ static int runtime_wmain(int argc, wchar_t** argv) {
     // install-time compiler emits this separate native DLL next to the game
     // module; require and validate it before the guest can reach the loader.
     const std::filesystem::path home_button_rso_path =
-        abs_module_path.parent_path() / native_module_file("RMGE01_home_button");
+        galaxy::native_module_path(
+            galaxy::native_module_sidecar_dir(abs_module_path), "RMGE01_home_button");
     if (!std::filesystem::is_regular_file(home_button_rso_path)) {
         std::wcerr << L"[boot] Required Home Button native sidecar is missing: "
                    << home_button_rso_path.c_str() << L'\n';
