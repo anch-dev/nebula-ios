@@ -48,9 +48,18 @@ probe xcrun --sdk iphoneos clang++
 if [ -n "${PROBE_CLANG:-}" ]; then
     probe "$PROBE_CLANG" -nostdinc++ -isystem "$libcxx"
 fi
+# Another clang version takes other branches in these headers too, so copy
+# every top-level C header and each whole directory the probe touched.
+mkdir -p "$out/sysroot/usr/include"
+find "$sdk/usr/include" -maxdepth 1 -type f -name '*.h' -exec cp {} "$out/sysroot/usr/include/" \;
 sort -u "$deps" | while read -r file; do
     case "$file" in
     "$sdk"/usr/include/c++/*) ;;
+    "$sdk"/usr/include/*/*)
+        rel=${file#"$sdk"/usr/include/}
+        top=${rel%%/*}
+        [ -d "$out/sysroot/usr/include/$top" ] || cp -R "$sdk/usr/include/$top" "$out/sysroot/usr/include/$top"
+        ;;
     "$sdk"/*)
         rel=${file#"$sdk"/}
         mkdir -p "$out/sysroot/$(dirname "$rel")"
