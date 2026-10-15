@@ -11,10 +11,24 @@
 // Presentation draws the swap-chain buffer into the app shell's
 // CAMetalLayer.
 
+// The Win32 headers and Objective-C both define BOOL (int vs bool), and the
+// COM headers define `interface` (as struct), which would turn @interface
+// into @struct. The Win32 BOOL is renamed for this file (it stays an int, so
+// signatures are unchanged), and the COM macros are dropped before the
+// Apple headers.
+#define BOOL GALAXY_WIN32_BOOL
 #include "layer.h"
 
 #include "galaxy/gx/shader_translate.h"
 #include "galaxy/host_platform.h"
+#undef BOOL
+#undef interface
+#undef IN
+#undef OUT
+#undef CONST
+#undef PURE
+#undef THIS
+#undef THIS_
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
