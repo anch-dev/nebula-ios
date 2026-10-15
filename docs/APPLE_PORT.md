@@ -132,14 +132,28 @@ timeline race test can time out under heavy QEMU load only).
    - Fixed on the way (all platforms): a decoded vertex's padding was left
      uninitialized, which made cached draw runs compare unequal.
 
+7c. **Metal backend** (`runtime/src/d3d12/backend_metal.mm`): resources are
+   shared MTLBuffers and private MTLTextures; recorded commands are encoded
+   into one command buffer per ExecuteCommandLists (render passes open on
+   render-target binds, whole-target clears are load actions, copies are
+   blits). Pipelines come from the shaders' SPIR-V through
+   `shader_translate.h`, with a Metal render pipeline per vertex stride.
+   Presentation draws into the app shell's CAMetalLayer.
+   - EFB depth (D24S8) is stored as Depth32Float, which holds every 24-bit
+     value exactly; copies to and from buffers convert to the D3D12 layout
+     (a compute kernel out, a depth-writing draw in).
+   - GX wide lines and points, geometry shaders on D3D12, run the vertex
+     shader with its outputs captured to a buffer, then a generated vertex
+     shader expands each primitive into a quad for the pixel shader.
+   - All upstream pixel tests pass on Apple Silicon: EFB conversion,
+     line/point rasterization and post-processing (SMAA, FXAA, FSR 1).
+   - Not supported: stencil (GX has none), logic ops (drawn unblended and
+     logged once), sampler LOD bias, compute shaders (unused by the
+     renderer).
+   `GALAXY_D3D12_BACKEND=cpu` forces the CPU backend.
+
 ## Next steps
 
-7c. **Metal backend** for the D3D12 layer: resources as MTLBuffer/MTLTexture,
-   recorded commands encoded into render/blit encoders, pipelines from
-   SPIR-V → MSL (`shader_translate.h`) with vertex descriptors from the
-   input layout, presentation into the app shell's CAMetalLayer. GX
-   lines/points (geometry shaders on D3D12) are drawn as Metal lines and
-   points at first.
 8. **Game module pipeline**: generated C++ → arm64 dylib(s) built on the
    user's PC (stock clang + lld, `-target arm64-apple-ios`), injected into the
    IPA before sideloading. Needs a header set that does not depend on the iOS
