@@ -180,10 +180,13 @@ timeline race test can time out under heavy QEMU load only).
    `galaxy_runtime_main` with the product environment
    (`installer/runtime-env.json`), content and saves in Documents (Files
    app), the CAMetalLayer view, touch controls (an Xbox-layout pad plus the
-   touch pointer), GCController gamepads and a hardware keyboard. CI
-   packages `Nebula.ipa` (ad-hoc signed with the entitlements).
-   Still to do: controller rumble, gyro pointer, pausing in the background,
-   an app icon, and testing on a device.
+   touch pointer), GCController gamepads and a hardware keyboard, and
+   vibration through Core Haptics (controllers, or the phone with touch
+   controls). CI packages `Nebula.ipa` (ad-hoc signed with the
+   entitlements) into the `nebula-ios-pc-kit` artifact with the recompiler,
+   the script and the module SDK.
+   Still to do: testing on a device (and what it turns up), gyro pointer,
+   pausing in the background, an app icon.
 
 ## Risks
 
