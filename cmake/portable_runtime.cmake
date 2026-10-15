@@ -515,6 +515,25 @@ if(GALAXY_SHADER_TRANSLATOR)
         target_link_libraries(NebulaRuntime PRIVATE galaxy_native_runtime)
         # The game module resolves its runtime imports from the executable.
         set_target_properties(NebulaRuntime PROPERTIES ENABLE_EXPORTS ON)
+    else()
+        # The iOS app (docs/APPLE_PORT.md step 9): apple/ios. CI packages
+        # Nebula.app as an IPA; the game modules are added on the user's PC.
+        enable_language(OBJCXX)
+        add_executable(Nebula MACOSX_BUNDLE apple/ios/NebulaApp.mm)
+        target_compile_options(Nebula PRIVATE -fobjc-arc)
+        target_link_libraries(Nebula PRIVATE galaxy_native_runtime
+            "-framework UIKit" "-framework GameController" "-framework AVFoundation"
+            "-framework QuartzCore" "-framework Metal" "-framework Foundation")
+        set_target_properties(Nebula PROPERTIES
+            MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/apple/ios/Info.plist.in"
+            MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.nebula.ios"
+            MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
+            MACOSX_BUNDLE_BUNDLE_VERSION "1")
+        # The product environment the Windows launcher applies.
+        add_custom_command(TARGET Nebula POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy
+                "${CMAKE_CURRENT_SOURCE_DIR}/installer/runtime-env.json"
+                "$<TARGET_BUNDLE_DIR:Nebula>/runtime-env.json")
     endif()
 endif()
 

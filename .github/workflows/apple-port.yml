@@ -70,13 +70,22 @@ jobs:
       # link stubs they need.
       - name: Package the module SDK
         run: |
+          set +e
           brew install llvm lld
-          PROBE_CLANG="$(brew --prefix llvm)/bin/clang++" tools/ios/package-module-sdk.sh build-ios nebula-ios-module-sdk
+          PROBE_CLANG="$(brew --prefix llvm)/bin/clang++" tools/ios/package-module-sdk.sh build-ios nebula-ios-module-sdk 2>&1 | tee sdk.log
+          status=${PIPESTATUS[0]}
+          [ "$status" = 0 ] || { grep -E "error|No such" sdk.log | head -20 | sed 's/^/::error::/'; tail -15 sdk.log | sed 's/^/::error::/'; }
+          exit $status
       - name: Check the module SDK with LLVM clang and ld64.lld, as on a PC
         shell: pwsh
         run: |
           $env:PATH = "$(brew --prefix lld)/bin:" + $env:PATH
-          ./tools/ios/build-modules.ps1 -Generated tools/ios/test/fake-generated -Sdk nebula-ios-module-sdk -Llvm "$(brew --prefix llvm)/bin" -Out module-test
+          try {
+            ./tools/ios/build-modules.ps1 -Generated tools/ios/test/fake-generated -Sdk nebula-ios-module-sdk -Llvm "$(brew --prefix llvm)/bin" -Out module-test *>&1 | Tee-Object -FilePath modules.log
+          } catch {
+            Get-Content modules.log -Tail 40 | ForEach-Object { "::error::$_" }
+            throw
+          }
           foreach ($m in 'RMGE01_game', 'RMGE01_home_button', 'RMGE01_dsp') {
             xcrun vtool -show-build "module-test/Frameworks/$m.framework/$m"
             if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -85,6 +94,20 @@ jobs:
         with:
           name: nebula-ios-module-sdk
           path: nebula-ios-module-sdk
+      # The app, without game modules (build-modules.ps1 adds them). Signed
+      # ad hoc only to carry its entitlements; SideStore/AltStore re-sign it.
+      - name: Package the IPA
+        run: |
+          mkdir -p ipa/Payload
+          cp -R build-ios/Nebula.app ipa/Payload/
+          codesign --force --sign - --entitlements apple/ios/Nebula.entitlements ipa/Payload/Nebula.app
+          codesign -d --entitlements - ipa/Payload/Nebula.app
+          (cd ipa && zip -qry ../Nebula.ipa Payload)
+          ls -l Nebula.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nebula-ipa
+          path: Nebula.ipa
 
   ios-module-kit:
     name: iOS module kit (build check on Windows, as on the user's PC)
@@ -108,7 +131,12 @@ jobs:
         shell: pwsh
         run: |
           & "C:\Program Files\LLVM\bin\clang++.exe" --version
-          ./tools/ios/build-modules.ps1 -Generated tools/ios/test/fake-generated -Sdk nebula-ios-module-sdk -Out module-test
+          try {
+            ./tools/ios/build-modules.ps1 -Generated tools/ios/test/fake-generated -Sdk nebula-ios-module-sdk -Out module-test *>&1 | Tee-Object -FilePath modules.log
+          } catch {
+            Get-Content modules.log -Tail 40 | ForEach-Object { "::error::$_" }
+            throw
+          }
           & "C:\Program Files\LLVM\bin\llvm-nm.exe" -gU module-test/Frameworks/RMGE01_game.framework/RMGE01_game
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Package the PC kit
